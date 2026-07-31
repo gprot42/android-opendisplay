@@ -38,12 +38,21 @@ enum StreamQuality: String, CaseIterable {
         }
     }
 
+    /// Baseline bitrate at ~1080p; [bitrate(forPixelsWide:pixelsHigh:)] scales up for larger frames.
     var bitrate: Int {
         switch self {
-        case .best: return 18_000_000
-        case .balanced: return 10_000_000
-        case .fast: return 6_000_000
+        case .best: return 24_000_000
+        case .balanced: return 12_000_000
+        case .fast: return 7_000_000
         }
+    }
+
+    /// Resolution-aware bitrate so 2.5K/3K streams stay sharp (base rates assume ~2 MP).
+    func bitrate(forPixelsWide w: Int, pixelsHigh h: Int) -> Int {
+        let mp = max(Double(w * h) / 1_000_000.0, 0.5)
+        let scaled = Double(bitrate) * (mp / 2.0)
+        // Floor at the preset base; cap so Wi‑Fi stays usable.
+        return min(max(Int(scaled), bitrate), 50_000_000)
     }
 
     var label: String {
@@ -56,9 +65,9 @@ enum StreamQuality: String, CaseIterable {
 
     var explanation: String {
         switch self {
-        case .best: return "Pixel-perfect at the device's native resolution. Highest bandwidth and latency."
-        case .balanced: return "75% capture resolution — noticeably lower latency, slight softness."
-        case .fast: return "Half resolution — lowest latency and bandwidth, visibly softer. Good for WiFi."
+        case .best: return "Full resolution + higher bitrate. Sharpest text; uses more Wi‑Fi bandwidth."
+        case .balanced: return "75% capture resolution — lower latency, slight softness."
+        case .fast: return "Half resolution — lowest latency and bandwidth, visibly softer. Good for congested WiFi."
         }
     }
 }
@@ -266,12 +275,25 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // here (in addition to the Permissions panel) so a fresh debug build
         // that lost TCC after re-sign is not stuck "Connected" with fps=0.
         if !CGPreflightScreenCaptureAccess() {
-            await status("Screen Recording permission needed — click Allow or enable in System Settings")
-            Log.info("Screen Recording permission missing — requesting access")
+            await status("Screen Recording needed — enable “OpenDisplay Dev” in System Settings → Privacy")
+            Log.info("Screen Recording permission missing — requesting access + opening Settings")
             CGRequestScreenCaptureAccess()
+            // Open Settings so the user can flip the toggle when the system
+            // dialog never appears (common for debug/ad-hoc builds).
+            await MainActor.run {
+                if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
+                    NSWorkspace.shared.open(url)
+                }
+            }
+            var reminded = false
             while !CGPreflightScreenCaptureAccess() {
                 try await Task.sleep(for: .seconds(1))
                 if stopped { return }
+                // Re-nudge once after a few seconds if still denied.
+                if !reminded {
+                    reminded = true
+                    await status("Waiting for Screen Recording — System Settings → Privacy & Security → Screen Recording → OpenDisplay Dev")
+                }
             }
             Log.info("Screen Recording permission granted")
         }
@@ -283,9 +305,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 throw NSError(domain: "MacSender", code: 1,
                               userInfo: [NSLocalizedDescriptionKey: "no displays found"])
             }
-            // SCDisplay reports points; capture at point resolution for M1.
-            let captureW = (Int(Double(display.width) * quality.scale)) & ~1
-            let captureH = (Int(Double(display.height) * quality.scale)) & ~1
+            // Capture at full Retina pixel size (not points) so mirror is sharp.
+            // SCDisplay width/height are points; CGDisplayPixels* is the framebuffer.
+            let (captureW, captureH) = Self.capturePixelSize(display: display, qualityScale: quality.scale)
             try await startCapture(display: display, pixelsWide: captureW, pixelsHigh: captureH)
 
         case .extend:
@@ -584,9 +606,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private func applyZoomBitrate(forceKeyframe: Bool = false) {
         guard let encoder else { return }
         let z = min(max(receiverZoom, 1), 4)
+        let base = quality.bitrate(forPixelsWide: max(captureWidth, 1), pixelsHigh: max(captureHeight, 1))
         // Super-linear enough to fight upscale softness; hard-capped for Wi‑Fi.
         let factor = 1.0 + (z - 1.0) * 1.5
-        let br = min(Int(Double(quality.bitrate) * factor), 40_000_000)
+        let br = min(Int(Double(base) * factor), 50_000_000)
         VTSessionSetProperty(encoder, key: kVTCompressionPropertyKey_AverageBitRate, value: br as CFNumber)
         VTSessionSetProperty(
             encoder,
@@ -765,9 +788,22 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         Task { await self.status("Connected to \(self.endpointName)") }
     }
 
+    /// Pixel dimensions for a capture of `display`, scaled by quality.
+    private static func capturePixelSize(display: SCDisplay, qualityScale: Double) -> (Int, Int) {
+        let pxW = CGDisplayPixelsWide(display.displayID)
+        let pxH = CGDisplayPixelsHigh(display.displayID)
+        // Fall back to points if CoreGraphics returns 0 (rare / headless).
+        let w = pxW > 0 ? pxW : display.width
+        let h = pxH > 0 ? pxH : display.height
+        return ((Int(Double(w) * qualityScale) & ~1),
+                (Int(Double(h) * qualityScale) & ~1))
+    }
+
     private func connectTCP(_ endpoint: NWEndpoint) {
         let options = NWProtocolTCP.Options()
         options.noDelay = true   // latency matters more than throughput here
+        options.enableKeepalive = true
+        options.keepaliveIdle = 5
         // Prefer a single path: multipath / Happy Eyeballs racing two
         // addresses (link-local + global IPv6) used to leave an orphan TCP
         // half-open on the receiver, which then "replaced" the live session
@@ -775,6 +811,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         let params = NWParameters(tls: nil, tcp: options)
         params.allowLocalEndpointReuse = true
         params.multipathServiceType = .disabled
+        // Prefer the faster local path; don't roam across expensive interfaces.
+        params.serviceClass = .responsiveData
 
         // Always retire the previous dial before opening another — otherwise
         // its stateUpdateHandler can still fire `.failed` and schedule a
@@ -794,7 +832,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // Bonjour resolution, so the retry loop reaches the receiver the
         // moment it advertises again.
         let generation = dialGeneration
-        queue.asyncAfter(deadline: .now() + 5.0) { [weak self] in
+        // Slightly longer timeout: Android + Wi‑Fi can take >5s after sleep.
+        queue.asyncAfter(deadline: .now() + 8.0) { [weak self] in
             guard let self, generation == self.dialGeneration, !self.stopped,
                   self.connection === conn, conn.state != .ready else { return }
             Log.info("dial timed out in \(conn.state) — redialing")
@@ -898,15 +937,19 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
     private func scheduleReconnect() {
         guard !stopped else { return }
+        // While Screen Recording is still missing we keep dialing patiently —
+        // the user may be flipping the Settings toggle; don't kill the session.
+        let waitingForScreenRecording = !CGPreflightScreenCaptureAccess()
+        let grace = waitingForScreenRecording ? max(disconnectGraceSeconds, 60) : disconnectGraceSeconds
         if everConnected {
             if let since = disconnectedSince {
-                if Date().timeIntervalSince(since) > disconnectGraceSeconds {
-                    reportGone("device gone for >\(Int(disconnectGraceSeconds))s — ending session")
+                if Date().timeIntervalSince(since) > grace {
+                    reportGone("device gone for >\(Int(grace))s — ending session")
                     return
                 }
             } else {
                 disconnectedSince = Date()
-                Task { await status("Connection lost — retrying for \(Int(disconnectGraceSeconds))s…") }
+                Task { await status("Connection lost — retrying for \(Int(grace))s…") }
             }
         }
         connectionReady = false
@@ -921,9 +964,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         pipelineLock.lock()
         pendingEncodes = 0
         pipelineLock.unlock()
-        queue.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+        // 1.5s gap reduces replace/RST thrash when both ends redial at once.
+        queue.asyncAfter(deadline: .now() + 1.5) { [weak self] in
             // Generation-guarded so a switchTransport (or another reconnect)
-            // that landed in this 1s window supersedes this dial instead of
+            // that landed in this window supersedes this dial instead of
             // racing it — otherwise the queued connect() re-dials the new
             // transport, briefly running two live connections. (No bare
             // self-rescheduling asyncAfter — the pattern banned in #76.)
@@ -1266,13 +1310,25 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         VTSessionSetProperty(encoder, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: 3600 as CFNumber)
         VTSessionSetProperty(encoder, key: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, value: 60 as CFNumber)
         VTSessionSetProperty(encoder, key: kVTCompressionPropertyKey_MaxFrameDelayCount, value: 0 as CFNumber)
-        VTSessionSetProperty(encoder, key: kVTCompressionPropertyKey_AverageBitRate, value: quality.bitrate as CFNumber)
+        let br = quality.bitrate(forPixelsWide: width, pixelsHigh: height)
+        VTSessionSetProperty(encoder, key: kVTCompressionPropertyKey_AverageBitRate, value: br as CFNumber)
+        // Soft data-rate ceiling (~1.5× average) reduces macroblocking on busy frames.
+        let bytesPerSecond = br / 8
+        let limits: [CFNumber] = [1 as CFNumber, (bytesPerSecond * 3 / 2) as CFNumber]
+        VTSessionSetProperty(encoder, key: kVTCompressionPropertyKey_DataRateLimits, value: limits as CFArray)
         VTSessionSetProperty(encoder, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: 60 as CFNumber)
-        VTSessionSetProperty(encoder, key: kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, value: kCFBooleanTrue)
+        // Prefer a bit more quality at "best"; speed bias for lower presets.
+        let preferSpeed = quality != .best
+        VTSessionSetProperty(encoder, key: kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality,
+                             value: preferSpeed ? kCFBooleanTrue : kCFBooleanFalse)
+        if quality == .best {
+            // 0.0–1.0; higher = better looking frames at the cost of size.
+            VTSessionSetProperty(encoder, key: kVTCompressionPropertyKey_Quality, value: 0.75 as CFNumber)
+        }
         VTCompressionSessionPrepareToEncodeFrames(encoder)
         // Re-apply zoom bitrate if the receiver is already pinched in.
         if receiverZoom > 1.02 { applyZoomBitrate(forceKeyframe: false) }
-        Log.info("encoder ready: \(width)x\(height) H.264 \(quality.bitrate / 1_000_000)Mbps quality=\(quality.rawValue) lowLatencyRC=\(lowLatency)")
+        Log.info("encoder ready: \(width)x\(height) H.264 \(br / 1_000_000)Mbps quality=\(quality.rawValue) lowLatencyRC=\(lowLatency)")
     }
 
     // MARK: - Capture callback

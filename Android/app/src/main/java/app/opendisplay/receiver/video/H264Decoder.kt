@@ -35,6 +35,7 @@ class H264Decoder(
     private var ptsUs = 0L
     private var configureAttempts = 0
     private var consecutiveInputDrops = 0
+    private var lastKeyframeRequestMs = 0L
 
     private val framesIn = AtomicLong(0)
     private val framesOut = AtomicLong(0)
@@ -120,7 +121,7 @@ class H264Decoder(
                     configure(s, p)
                 } catch (e: Exception) {
                     Log.e(tag, "configure failed (API ${Build.VERSION.SDK_INT})", e)
-                    onNeedKeyframe()
+                    requestKeyframeThrottled()
                     return
                 }
             }
@@ -225,11 +226,13 @@ class H264Decoder(
             if (inIndex < 0) {
                 inputDrops.incrementAndGet()
                 consecutiveInputDrops++
-                // After a few drops, demand an IDR so we can resync cleanly.
-                if (consecutiveInputDrops >= 2 || isIdr) {
-                    onNeedKeyframe()
+                // After a few drops, demand an IDR — but rate-limit: a storm of
+                // kf messages clogs the control channel and makes the Mac
+                // re-key every frame (bitrate spikes / more drops).
+                if (consecutiveInputDrops >= 3 || isIdr) {
+                    requestKeyframeThrottled()
                 }
-                if (consecutiveInputDrops == 1 || consecutiveInputDrops % 30 == 0) {
+                if (consecutiveInputDrops == 1 || consecutiveInputDrops % 60 == 0) {
                     Log.w(tag, "no input buffer — drop frame (drops=${inputDrops.get()})")
                 }
                 return false
@@ -241,7 +244,7 @@ class H264Decoder(
                 Log.w(tag, "input buffer too small ${buf.remaining()} < ${annexB.size}")
                 c.queueInputBuffer(inIndex, 0, 0, ptsUs, 0)
                 inputDrops.incrementAndGet()
-                onNeedKeyframe()
+                requestKeyframeThrottled()
                 return false
             }
             buf.put(annexB)
@@ -252,9 +255,17 @@ class H264Decoder(
             Log.e(tag, "queueInput failed", e)
             releaseCodecOnly()
             configured = false
-            onNeedKeyframe()
+            requestKeyframeThrottled()
             return false
         }
+    }
+
+    /** At most one keyframe request per 500ms. */
+    private fun requestKeyframeThrottled() {
+        val now = System.currentTimeMillis()
+        if (now - lastKeyframeRequestMs < 500) return
+        lastKeyframeRequestMs = now
+        onNeedKeyframe()
     }
 
     private fun drainOutput() {
@@ -294,7 +305,7 @@ class H264Decoder(
             }
             releaseCodecOnly()
             configured = false
-            onNeedKeyframe()
+            requestKeyframeThrottled()
         }
     }
 

@@ -95,6 +95,7 @@ enum MainWindow {
 enum ConnectionTarget: Hashable {
     case usb(udid: String?)           // wired via built-in usbmuxd; nil = first device
     case wifi(NWBrowser.Result)       // discovered via Bonjour
+    case androidUsb                   // Android cable via adb reverse → 127.0.0.1
 
     /// Stable identity for sessions and persistence — survives Bonjour
     /// re-discovery (fresh NWBrowser.Result) and USB replugs (new DeviceID).
@@ -104,6 +105,7 @@ enum ConnectionTarget: Hashable {
         case .wifi(let result):
             if case .service(let name, _, _, _) = result.endpoint { return "wifi:\(name)" }
             return "wifi:unknown"
+        case .androidUsb: return "android-usb"
         }
     }
 }
@@ -142,17 +144,27 @@ final class DeviceSession: ObservableObject, Identifiable {
     // and its service row.
     var wifiServiceName: String?
 
-    var transportLabel: String { onUSB ? "USB" : "WiFi" }
+    var transportLabel: String {
+        switch target {
+        case .androidUsb: return "USB (Android)"
+        case .usb: return onUSB ? "USB" : "WiFi"
+        case .wifi: return onUSB ? "USB" : "WiFi"
+        }
+    }
 
     init(id: String, target: ConnectionTarget, name: String, sender: MacSender) {
         self.id = id
         self.target = target
         self.name = name
         self.sender = sender
-        if case .usb(let udid) = target {
+        switch target {
+        case .usb(let udid):
             onUSB = true
             usbUDID = udid
-        } else {
+        case .androidUsb:
+            onUSB = true
+            usbUDID = nil
+        case .wifi:
             onUSB = false
         }
     }
@@ -176,6 +188,9 @@ final class SenderController: ObservableObject {
     @Published var sessions: [DeviceSession] = []
     @Published var discovered: [NWBrowser.Result] = []
     @Published var usbDevices: [UsbmuxDevice] = []
+    /// adb-visible Android devices (for the Android USB row).
+    @Published var androidUsbAvailable = false
+    @Published var androidUsbLabel = "Android USB"
     // `-host x.x.x.x` / `-port n` bypass usbmuxd with a manual TCP endpoint
     // (debugging escape hatch, e.g. an iproxy or SSH tunnel).
     @Published var host = UserDefaults.standard.string(forKey: "host") ?? "127.0.0.1"
@@ -240,10 +255,36 @@ final class SenderController: ObservableObject {
             self.failover(detachedUDIDs: detached)
             self.autoConnect()
         }
+        startAndroidAdbPolling()
         Task { @MainActor in
             try? await Task.sleep(for: .seconds(2))
             self.wifiAutoConnectArmed = true
             self.autoConnect()
+        }
+    }
+
+    /// Poll `adb devices` so the Android USB row appears when a phone is cabled.
+    private func startAndroidAdbPolling() {
+        Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                let serials = await Task.detached(priority: .utility) {
+                    AndroidAdb.deviceSerials()
+                }.value
+                let name = await Task.detached(priority: .utility) {
+                    AndroidAdb.displayName()
+                }.value
+                self.androidUsbAvailable = !serials.isEmpty
+                self.androidUsbLabel = name ?? "Android USB"
+                // Refresh adb reverse for a live Android USB session (replug).
+                if self.session(for: ConnectionTarget.androidUsb.sessionID) != nil,
+                   let portNum = UInt16(self.port) {
+                    await Task.detached(priority: .utility) {
+                        _ = AndroidAdb.reverse(port: portNum)
+                    }.value
+                }
+                try? await Task.sleep(for: .seconds(3))
+            }
         }
     }
 
@@ -386,13 +427,14 @@ final class SenderController: ObservableObject {
     /// service stall rather than getting refused). Report the withdrawal to
     /// each live WiFi session's sender; it only acts if its connection is
     /// already down too, which together proves the app is gone. Debounced
-    /// 3s: an mDNS record can drop briefly during a WiFi roam — only a
-    /// withdrawal that persists counts. One-shot, guarded re-check, so
-    /// overlapping browse events at worst repeat an idempotent call.
+    /// 8s: mDNS can drop for several seconds on Android OEM Wi‑Fi / during
+    /// sleep-wake — only a withdrawal that persists counts. One-shot,
+    /// guarded re-check, so overlapping browse events at worst repeat an
+    /// idempotent call.
     private func endSessionsWhoseServiceVanished() {
         for session in sessions where !session.onUSB {
             guard wifiService(for: session) == nil else { continue }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self, weak session] in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self, weak session] in
                 guard let self, let session,
                       self.sessions.contains(where: { $0 === session }),
                       self.wifiService(for: session) == nil else { return }
@@ -447,6 +489,8 @@ final class SenderController: ObservableObject {
             return udid == nil ? "Manual (\(host):\(port))" : "iPhone / iPad"
         case .wifi(let result):
             return serviceName(of: result) ?? "WiFi device"
+        case .androidUsb:
+            return AndroidAdb.displayName() ?? "Android USB"
         }
     }
 
@@ -493,6 +537,7 @@ final class SenderController: ObservableObject {
         switch target {
         case .usb: usbDisabled.remove(id)
         case .wifi: wifiRemembered.insert(id)
+        case .androidUsb: break
         }
 
         let transport: SenderTransport
@@ -508,6 +553,14 @@ final class SenderController: ObservableObject {
             }
         case .wifi(let result):
             transport = .tcp(result.endpoint)
+        case .androidUsb:
+            guard let portNum = UInt16(port) else { return }
+            // Reverse phone:9000 → Mac:9000 so we dial loopback.
+            if !AndroidAdb.reverse(port: portNum) {
+                Log.info("Android USB: adb reverse failed — is the phone in USB mode with debugging on?")
+            }
+            transport = .tcp(.hostPort(host: "127.0.0.1",
+                                       port: NWEndpoint.Port(rawValue: portNum)!))
         }
 
         let name = label(for: target)
@@ -584,6 +637,7 @@ final class SenderController: ObservableObject {
         switch session.target {
         case .usb: usbDisabled.insert(session.id)
         case .wifi: wifiRemembered.remove(session.id)
+        case .androidUsb: break
         }
         // A migrated session is also reachable the other way — opt that side
         // out too, or auto-connect resurrects the device moments later.
@@ -618,8 +672,10 @@ final class SenderController: ObservableObject {
         let name: String
         let usbTarget: ConnectionTarget?
         let wifiTarget: ConnectionTarget?
+        let androidUsbTarget: ConnectionTarget?
 
         var transportLabel: String {
+            if androidUsbTarget != nil { return "USB (Android)" }
             switch (usbTarget != nil, wifiTarget != nil) {
             case (true, true): return "USB · WiFi"
             case (true, false): return "USB"
@@ -627,14 +683,39 @@ final class SenderController: ObservableObject {
             default: return ""
             }
         }
-        /// Lowest latency first.
-        var preferredTarget: ConnectionTarget? { usbTarget ?? wifiTarget }
+        /// Lowest latency first. Network/Wi‑Fi is the default path; USB only
+        /// when the user (or cable auto-connect for Apple) picks it.
+        var preferredTarget: ConnectionTarget? {
+            androidUsbTarget ?? usbTarget ?? wifiTarget
+        }
+
+        init(id: String, name: String,
+             usbTarget: ConnectionTarget? = nil,
+             wifiTarget: ConnectionTarget? = nil,
+             androidUsbTarget: ConnectionTarget? = nil) {
+            self.id = id
+            self.name = name
+            self.usbTarget = usbTarget
+            self.wifiTarget = wifiTarget
+            self.androidUsbTarget = androidUsbTarget
+        }
     }
 
     var deviceEntries: [DeviceEntry] {
         var entries: [DeviceEntry] = []
         var mergedServices = Set<String>()
         var coveredSessionIDs = Set<String>()
+
+        // Android USB (adb) — only when a phone is cabled and adb is installed.
+        // Not auto-connected: Network remains the default; user taps Connect.
+        if androidUsbAvailable || session(for: ConnectionTarget.androidUsb.sessionID) != nil {
+            let target = ConnectionTarget.androidUsb
+            coveredSessionIDs.insert(target.sessionID)
+            entries.append(DeviceEntry(
+                id: target.sessionID,
+                name: androidUsbLabel,
+                androidUsbTarget: target))
+        }
 
         for device in usbDevices {
             // A discovered WiFi service for the same hardware folds into
@@ -688,6 +769,9 @@ final class SenderController: ObservableObject {
     }
 
     func session(for entry: DeviceEntry) -> DeviceSession? {
+        if let target = entry.androidUsbTarget {
+            if let s = session(for: target.sessionID) { return s }
+        }
         if let target = entry.usbTarget {
             if let s = session(for: target.sessionID) { return s }
             if case .usb(let udid?) = target,
@@ -728,19 +812,37 @@ final class PermissionMonitor: ObservableObject {
     /// Fire the system permission dialog on demand. macOS only shows each
     /// dialog once per reset — after that the call just (re)registers the
     /// app in System Settings, so the row exists to toggle manually.
+    ///
+    /// Always also open the Privacy pane: on recent macOS (and for ad-hoc /
+    /// freshly rebuilt binaries) the dialog is easy to miss or never appears,
+    /// and the only reliable grant path is the Screen Recording list toggle.
     func requestScreenRecording() {
+        // Register the app with TCC first so a row exists to toggle.
         CGRequestScreenCaptureAccess()
-        refresh()
+        Self.openPrivacyPane("Privacy_ScreenCapture")
+        // Preflight can lag a beat after the user flips the switch.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.refresh() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { self.refresh() }
     }
 
     func requestAccessibility() {
         _ = InputInjector.ensureAccessibilityPermission()
-        refresh()
+        Self.openPrivacyPane("Privacy_Accessibility")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.refresh() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { self.refresh() }
     }
 
+    /// Open System Settings → Privacy for the given anchor.
+    /// Tries Sequoia/Tahoe URLs first, then the legacy preference pane.
     static func openPrivacyPane(_ anchor: String) {
-        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?\(anchor)") {
-            NSWorkspace.shared.open(url)
+        // macOS 15+ Settings deep links (extension id form).
+        let candidates = [
+            "x-apple.systempreferences:com.apple.preference.security?\(anchor)",
+            "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?\(anchor)",
+            "x-apple.systempreferences:com.apple.preference.security",
+        ]
+        for s in candidates {
+            if let url = URL(string: s), NSWorkspace.shared.open(url) { return }
         }
     }
 }
@@ -768,8 +870,13 @@ struct ContentView: View {
                 }
                 Spacer()
                 if controller.running {
-                    Button("Disconnect All") { controller.disconnectAll() }
-                        .controlSize(.large)
+                    Button(role: .destructive) {
+                        controller.disconnectAll()
+                    } label: {
+                        Label("Disconnect All", systemImage: "xmark.circle.fill")
+                    }
+                    .controlSize(.large)
+                    .help("End every session and free the virtual displays")
                 }
             }
             .padding(16)
@@ -804,10 +911,14 @@ struct ContentView: View {
                                 }
                                 Spacer()
                                 if let target = entry.preferredTarget {
-                                    Button("Connect") {
+                                    Button {
                                         controller.connect(to: target, userInitiated: true)
+                                    } label: {
+                                        Label("Connect", systemImage: "link")
                                     }
-                                    .controlSize(.small)
+                                    .controlSize(.regular)
+                                    .buttonStyle(.borderedProminent)
+                                    .help("Start streaming to this device")
                                 }
                             }
                         }
@@ -933,7 +1044,7 @@ struct ContentView: View {
                 if let request {
                     Button("Grant…") { request() }
                         .controlSize(.small)
-                        .help("Ask macOS for this permission. If the system dialog was already dismissed once, this registers the app under \(title) in System Settings — flip the toggle there.")
+                        .help("Requests permission and opens System Settings. Look for \"OpenDisplay Dev\" (debug) or \"OpenDisplay\" (release) under \(title) and enable the toggle. You may need to quit and reopen the app after enabling.")
                 }
                 Button("Open Settings") {
                     PermissionMonitor.openPrivacyPane(anchor)
@@ -992,32 +1103,49 @@ struct SessionRow: View {
     }
 
     var body: some View {
-        HStack(alignment: .firstTextBaseline) {
-            Circle()
-                .fill(statusColor)
-                .frame(width: 9, height: 9)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                Text("\(session.transportLabel) · \(session.status)")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline) {
+                Circle()
+                    .fill(statusColor)
+                    .frame(width: 9, height: 9)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                        .font(.body.weight(.medium))
+                    Text("\(session.transportLabel) · \(session.status)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+                Spacer(minLength: 8)
+                if session.mbps > 0 {
+                    Text("\(String(format: "%.1f", session.mbps)) Mbit/s")
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
             }
-            Spacer()
-            if session.mbps > 0 {
-                Text("\(String(format: "%.1f", session.mbps)) Mbit/s")
-                    .font(.system(.caption, design: .monospaced))
-                    .foregroundStyle(.secondary)
-            }
-            Button {
-                session.sender.forceReconnect()
-            } label: {
-                Image(systemName: "arrow.clockwise")
-            }
-            .controlSize(.small)
-            .help("Drop the connection and pair with the device again")
-            Button("Disconnect") { controller.disconnect(session) }
+
+            HStack(spacing: 8) {
+                Button {
+                    session.sender.forceReconnect()
+                } label: {
+                    Label("Reconnect", systemImage: "arrow.clockwise")
+                }
                 .controlSize(.small)
+                .help("Drop the TCP link and pair with this device again (keeps the virtual display when possible)")
+
+                Spacer(minLength: 0)
+
+                Button(role: .destructive) {
+                    controller.disconnect(session)
+                } label: {
+                    Label("Disconnect", systemImage: "xmark.circle.fill")
+                }
+                .controlSize(.regular)
+                .buttonStyle(.bordered)
+                .tint(.red)
+                .help("Stop streaming to this device and remove its virtual display")
+            }
         }
+        .padding(.vertical, 2)
     }
 }

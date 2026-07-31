@@ -28,9 +28,9 @@ Free, open source, no subscription — alternative to Sidecar / Duet / Luna on h
 ## Features
 
 - True display extension (or mirror) via Mac OpenDisplay
-- **Wi‑Fi** only on Android (same wire protocol as iOS)
+- **Network (Wi‑Fi) by default** · optional **USB** via `adb reverse`
 - Hardware H.264 decode · touch + two-finger scroll · pinch-to-zoom · cursor overlay
-- Portrait / landscape · mDNS discovery + manual IP
+- Portrait / landscape · mDNS discovery + manual IP · stays running in background
 
 ## What works
 
@@ -42,7 +42,9 @@ Free, open source, no subscription — alternative to Sidecar / Duet / Luna on h
 | Mac cursor overlay | ✅ |
 | mDNS (`_opensidecar._tcp`) | ✅ when LAN allows multicast |
 | Manual IP connect | ✅ |
-| USB (usbmuxd) | ❌ — use Wi‑Fi or `adb reverse` |
+| **Network mode (default)** | ✅ Wi‑Fi / LAN |
+| **USB mode** | ✅ cable + USB debugging; Mac **Android USB** runs `adb reverse` |
+| Background keep-alive | ✅ foreground service (session survives Home) |
 
 ## Android versions
 
@@ -81,9 +83,10 @@ adb install -r ~/OpenDisplay-*-debug.apk
 
 Needs JDK 17+ and the Android SDK. Details: [`Android/README.md`](Android/README.md).
 
-1. Open the Android app (foreground).
-2. Same Wi‑Fi as the Mac (or `adb reverse tcp:9000 tcp:9000` → Mac connects to `127.0.0.1:9000`).
-3. Mac OpenDisplay → pick Wi‑Fi device or enter **IP:9000** from the idle screen.
+1. Open the Android app.
+2. **Network (default):** same Wi‑Fi → Mac OpenDisplay → pick the device (or **IP:9000**).
+3. **USB:** phone **USB** mode + USB debugging + cable → Mac OpenDisplay → **Android USB**
+   (requires `adb` on the Mac; OpenDisplay runs `adb reverse` for you).
 4. Grant Mac **Screen Recording** + **Accessibility** if prompted.
 
 ## How it works

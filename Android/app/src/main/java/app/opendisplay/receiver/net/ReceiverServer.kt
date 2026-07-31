@@ -47,6 +47,8 @@ data class ReceiverUiState(
     val serviceName: String = "OpenDisplay",
     /** e.g. "Android 15 (API 35) · Pixel Tablet" for support reports. */
     val deviceSummary: String = "",
+    /** Network (default) or USB cable path. */
+    val connectionMode: String = "NETWORK",
 )
 
 /**
@@ -81,6 +83,7 @@ class ReceiverServer(
     private var watchdogJob: Job? = null
     private var pingJob: Job? = null
     private var statsJob: Job? = null
+    private var helloDebounceJob: Job? = null
 
     private var state = ReceiverUiState()
 
@@ -103,7 +106,13 @@ class ReceiverServer(
         val changed = panel != info
         panel = info
         if (changed && state.connected) {
-            scope.launch { sendHello() }
+            // Debounce: orientation / surface size can fire several times in a
+            // row; flooding the Mac with hello rebuilds drops the stream.
+            helloDebounceJob?.cancel()
+            helloDebounceJob = scope.launch {
+                delay(250)
+                if (state.connected) sendHello()
+            }
         }
     }
 
@@ -216,8 +225,13 @@ class ReceiverServer(
     private suspend fun listenLoop() {
         while (scope.isActive && running) {
             try {
-                val server = ServerSocket(port)
+                // reuseAddress must be set BEFORE bind; ServerSocket(port) binds
+                // immediately and the flag would be ignored — causing flaky
+                // "address already in use" after a quick restart.
+                val server = ServerSocket()
                 server.reuseAddress = true
+                server.bind(java.net.InetSocketAddress(port))
+                // Accept both IPv4 and IPv6; Mac may dial either after Bonjour.
                 serverSocket = server
                 publish(
                     state.copy(
@@ -244,8 +258,13 @@ class ReceiverServer(
                     // rejecting the new one leaves a zombie session with no
                     // sender and a permanent connect/RST thrash.)
                     closeClient("replaced")
-                    socket.tcpNoDelay = true
-                    socket.keepAlive = true
+                    try {
+                        socket.tcpNoDelay = true
+                        socket.keepAlive = true
+                        // Detect half-open peers faster on flaky Wi‑Fi.
+                        socket.soTimeout = 0 // framing does blocking reads
+                    } catch (_: Exception) {
+                    }
                     clientSocket.set(socket)
                     sessionJob = scope.launch { runSession(socket) }
                 }
@@ -253,6 +272,11 @@ class ReceiverServer(
                 if (!running) break
                 Log.e(tag, "listen error", e)
                 publish(state.copy(status = "Listen error: ${e.message}", listening = false))
+                try {
+                    serverSocket?.close()
+                } catch (_: Exception) {
+                }
+                serverSocket = null
                 delay(1_000)
             }
         }
@@ -451,10 +475,17 @@ class ReceiverServer(
     private fun startWatchdog() {
         watchdogJob?.cancel()
         watchdogJob = scope.launch {
+            // Longer first grace: Mac may still be building the virtual display
+            // / waiting for Screen Recording after TCP connects (often 5–15s).
+            val connectedAt = System.currentTimeMillis()
             while (isActive) {
                 delay(1_000)
                 val idle = System.currentTimeMillis() - lastDataMs.get()
-                if (idle > 5_000) {
+                val sinceConnect = System.currentTimeMillis() - connectedAt
+                // First 12s: allow longer silence (setup / permission). After
+                // that, 6s of total radio silence means a half-open link.
+                val limit = if (sinceConnect < 12_000) 12_000L else 6_000L
+                if (idle > limit) {
                     Log.w(tag, "watchdog: no data for ${idle}ms — dropping")
                     closeClient("watchdog")
                     break

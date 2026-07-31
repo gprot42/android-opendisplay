@@ -15,11 +15,16 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
@@ -30,6 +35,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -57,11 +63,15 @@ class MainActivity : ComponentActivity() {
     private lateinit var nsd: NsdAdvertiser
     private lateinit var touchMapper: TouchMapper
     private val uiState = MutableStateFlow(ReceiverUiState())
+    private var connectionMode: ConnectionMode = ConnectionMode.NETWORK
 
     /** Bound when the video view is inflated; cursor updates post to it. */
     @Volatile private var cursorView: CursorOverlayView? = null
     @Volatile private var videoView: TextureView? = null
     @Volatile private var videoSurface: Surface? = null
+    /** Keeps decode alive while the activity is stopped (home / recents). */
+    @Volatile private var holdSurfaceTexture: SurfaceTexture? = null
+    @Volatile private var holdSurface: Surface? = null
     @Volatile private var latestViewport: TouchMapper.Viewport = TouchMapper.Viewport()
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -70,15 +80,20 @@ class MainActivity : ComponentActivity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
         val app = application as OpenDisplayApp
+        connectionMode = ConnectionMode.load(this)
         val deviceInfo = DeviceReport.collect()
         DeviceReport.logOnce()
         if (!deviceInfo.hasAvcDecoder) {
             uiState.value = uiState.value.copy(
                 status = "No H.264 decoder on this device — cannot stream",
                 deviceSummary = deviceInfo.summaryLine(),
+                connectionMode = connectionMode.name,
             )
         } else {
-            uiState.value = uiState.value.copy(deviceSummary = deviceInfo.summaryLine())
+            uiState.value = uiState.value.copy(
+                deviceSummary = deviceInfo.summaryLine(),
+                connectionMode = connectionMode.name,
+            )
         }
 
         decoder = H264Decoder(
@@ -95,12 +110,11 @@ class MainActivity : ComponentActivity() {
             onState = { next ->
                 uiState.value = next.copy(
                     deviceSummary = next.deviceSummary.ifEmpty { deviceInfo.summaryLine() },
+                    connectionMode = connectionMode.name,
                 )
             },
             decoder = decoder,
             onCursor = { x, y, visible ->
-                // Mac cursor is full-desktop normalized. When zoomed, the stream
-                // is ROI-cropped to contentX/Y/W/H, so remap into that rect.
                 val vp = latestViewport
                 if (vp.scale <= 1.05f || vp.contentW <= 0.001f || vp.contentH <= 0.001f) {
                     cursorView?.setCursorPosition(x, y, visible)
@@ -135,10 +149,6 @@ class MainActivity : ComponentActivity() {
         )
         touchMapper = TouchMapper(this, server) { viewport ->
             latestViewport = viewport
-            // Instant local pinch for feedback. The Mac ROI-crops capture to
-            // the same rect and re-encodes at full stream resolution, so after
-            // ~1 RTT the magnified region has real pixels (not just upscale).
-            // Local scale is eased so we don't fully double-zoom the ROI feed.
             applyViewport(viewport)
         }
         nsd = NsdAdvertiser(this)
@@ -147,25 +157,30 @@ class MainActivity : ComponentActivity() {
         server.setServiceName(defaultName)
         updatePanelFromDisplay()
         server.start(WireProtocol.DEFAULT_PORT)
-        nsd.register(defaultName, WireProtocol.DEFAULT_PORT, app.installId)
+        applyConnectionMode(connectionMode)
+        ReceiverForegroundService.start(this)
 
         setContent {
             MaterialTheme(colorScheme = darkColorScheme()) {
                 val state by uiState.collectAsState()
                 ReceiverScreen(
                     state = state,
+                    onConnectionMode = { mode -> setConnectionMode(mode) },
                     onBindViews = { texture, cursor ->
                         videoView = texture
                         cursorView = cursor
                         applyViewport(touchMapper.viewport())
                     },
                     onSurfaceReady = { surface ->
+                        releaseHoldSurface()
                         videoSurface?.release()
                         videoSurface = surface
                         decoder.setSurface(surface)
                     },
                     onSurfaceDestroyed = {
-                        decoder.setSurface(null)
+                        // Keep decoding into an off-screen surface so the Mac
+                        // session survives home / recents (foreground service).
+                        attachHoldSurface()
                         videoSurface?.release()
                         videoSurface = null
                     },
@@ -180,18 +195,77 @@ class MainActivity : ComponentActivity() {
         lifecycle.addObserver(
             LifecycleEventObserver { _, event ->
                 when (event) {
-                    Lifecycle.Event.ON_STOP -> server.announceSleeping()
+                    // Do NOT announce sleeping on ON_STOP — the foreground
+                    // service keeps the TCP session for a real second-monitor.
+                    Lifecycle.Event.ON_START -> {
+                        if (::nsd.isInitialized && connectionMode == ConnectionMode.NETWORK) {
+                            val name = Build.MODEL.ifBlank { "OpenDisplay" }
+                            nsd.register(name, WireProtocol.DEFAULT_PORT, app.installId)
+                        }
+                    }
                     Lifecycle.Event.ON_DESTROY -> {
-                        server.announceClosing()
-                        nsd.unregister()
-                        server.stop()
-                        videoSurface?.release()
-                        videoSurface = null
+                        if (!isChangingConfigurations) {
+                            server.announceClosing()
+                            nsd.unregister()
+                            server.stop()
+                            ReceiverForegroundService.stop(this)
+                            releaseHoldSurface()
+                            videoSurface?.release()
+                            videoSurface = null
+                        }
                     }
                     else -> Unit
                 }
             },
         )
+    }
+
+    private fun setConnectionMode(mode: ConnectionMode) {
+        if (mode == connectionMode) return
+        connectionMode = mode
+        ConnectionMode.save(this, mode)
+        uiState.value = uiState.value.copy(connectionMode = mode.name)
+        applyConnectionMode(mode)
+    }
+
+    private fun applyConnectionMode(mode: ConnectionMode) {
+        val name = Build.MODEL.ifBlank { "OpenDisplay" }
+        when (mode) {
+            ConnectionMode.NETWORK -> {
+                nsd.register(name, WireProtocol.DEFAULT_PORT, (application as OpenDisplayApp).installId)
+            }
+            ConnectionMode.USB -> {
+                // Mac reaches us via adb reverse → 127.0.0.1:9000; mDNS is optional noise.
+                nsd.unregister()
+            }
+        }
+    }
+
+    private fun attachHoldSurface() {
+        if (holdSurface != null) {
+            decoder.setSurface(holdSurface)
+            return
+        }
+        val st = SurfaceTexture(0)
+        st.setDefaultBufferSize(16, 16)
+        val surface = Surface(st)
+        holdSurfaceTexture = st
+        holdSurface = surface
+        decoder.setSurface(surface)
+    }
+
+    private fun releaseHoldSurface() {
+        decoder.setSurface(null)
+        try {
+            holdSurface?.release()
+        } catch (_: Exception) {
+        }
+        try {
+            holdSurfaceTexture?.release()
+        } catch (_: Exception) {
+        }
+        holdSurface = null
+        holdSurfaceTexture = null
     }
 
     private fun applyViewport(viewport: TouchMapper.Viewport) {
@@ -247,6 +321,7 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun ReceiverScreen(
     state: ReceiverUiState,
+    onConnectionMode: (ConnectionMode) -> Unit,
     onBindViews: (TextureView?, CursorOverlayView?) -> Unit,
     onSurfaceReady: (Surface) -> Unit,
     onSurfaceDestroyed: () -> Unit,
@@ -326,13 +401,18 @@ private fun ReceiverScreen(
         )
 
         if (!state.streaming) {
-            IdleOverlay(state)
+            IdleOverlay(state, onConnectionMode)
         }
     }
 }
 
 @Composable
-private fun IdleOverlay(state: ReceiverUiState) {
+private fun IdleOverlay(
+    state: ReceiverUiState,
+    onConnectionMode: (ConnectionMode) -> Unit,
+) {
+    val mode = ConnectionMode.entries.firstOrNull { it.name == state.connectionMode }
+        ?: ConnectionMode.NETWORK
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -354,45 +434,73 @@ private fun IdleOverlay(state: ReceiverUiState) {
             fontSize = 18.sp,
             textAlign = TextAlign.Center,
         )
-        Spacer(modifier = Modifier.height(24.dp))
+        Spacer(modifier = Modifier.height(20.dp))
+        ConnectionModePicker(selected = mode, onSelect = onConnectionMode)
+        Spacer(modifier = Modifier.height(20.dp))
         Text(
             text = "Port ${state.port}",
             color = Color.White,
             fontFamily = FontFamily.Monospace,
             fontSize = 16.sp,
         )
-        if (state.localAddresses.isNotEmpty()) {
-            Spacer(modifier = Modifier.height(8.dp))
-            state.localAddresses.forEach { ip ->
+        when (mode) {
+            ConnectionMode.NETWORK -> {
+                if (state.localAddresses.isNotEmpty()) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    state.localAddresses.forEach { ip ->
+                        Text(
+                            text = "$ip:${state.port}",
+                            color = Color(0xFF8AB4F8),
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 18.sp,
+                        )
+                    }
+                }
+                Spacer(modifier = Modifier.height(20.dp))
                 Text(
-                    text = "$ip:${state.port}",
+                    text = "Same Wi‑Fi as your Mac. OpenDisplay → pick this device,\nor connect with an address above.",
+                    color = Color(0xFF9E9E9E),
+                    fontSize = 14.sp,
+                    textAlign = TextAlign.Center,
+                    lineHeight = 20.sp,
+                )
+            }
+            ConnectionMode.USB -> {
+                Spacer(modifier = Modifier.height(12.dp))
+                Text(
+                    text = "127.0.0.1:${state.port}",
                     color = Color(0xFF8AB4F8),
                     fontFamily = FontFamily.Monospace,
                     fontSize = 18.sp,
                 )
+                Spacer(modifier = Modifier.height(16.dp))
+                Text(
+                    text = "1. Enable USB debugging on this phone\n" +
+                        "2. Plug into the Mac with a data cable\n" +
+                        "3. Mac OpenDisplay → Android USB\n" +
+                        "   (runs adb reverse to port ${state.port})",
+                    color = Color(0xFF9E9E9E),
+                    fontSize = 14.sp,
+                    textAlign = TextAlign.Center,
+                    lineHeight = 20.sp,
+                )
             }
         }
-        Spacer(modifier = Modifier.height(24.dp))
-        Text(
-            text = "On your Mac: open OpenDisplay → connect over WiFi,\nor use manual host with an address above.",
-            color = Color(0xFF9E9E9E),
-            fontSize = 14.sp,
-            textAlign = TextAlign.Center,
-            lineHeight = 20.sp,
-        )
         Spacer(modifier = Modifier.height(12.dp))
         Text(
-            text = "Pinch to zoom (higher quality while zoomed) · double-tap to reset · two-finger pan scrolls",
+            text = "Pinch to zoom · double-tap reset · stays on in background",
             color = Color(0xFF6E6E6E),
             fontSize = 12.sp,
             textAlign = TextAlign.Center,
         )
-        Spacer(modifier = Modifier.height(8.dp))
-        Text(
-            text = "Advertised as \"${state.serviceName}\"",
-            color = Color(0xFF6E6E6E),
-            fontSize = 12.sp,
-        )
+        if (mode == ConnectionMode.NETWORK) {
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                text = "Advertised as \"${state.serviceName}\"",
+                color = Color(0xFF6E6E6E),
+                fontSize = 12.sp,
+            )
+        }
         if (state.deviceSummary.isNotEmpty()) {
             Spacer(modifier = Modifier.height(16.dp))
             Text(
@@ -402,6 +510,42 @@ private fun IdleOverlay(state: ReceiverUiState) {
                 fontSize = 11.sp,
                 textAlign = TextAlign.Center,
             )
+        }
+    }
+}
+
+@Composable
+private fun ConnectionModePicker(
+    selected: ConnectionMode,
+    onSelect: (ConnectionMode) -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth(0.85f)
+            .selectableGroup(),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        ConnectionMode.entries.forEach { mode ->
+            val active = mode == selected
+            Surface(
+                modifier = Modifier
+                    .weight(1f)
+                    .selectable(
+                        selected = active,
+                        onClick = { onSelect(mode) },
+                        role = Role.RadioButton,
+                    ),
+                color = if (active) Color(0xFF3B82F6) else Color(0xFF2A2A2A),
+                shape = MaterialTheme.shapes.small,
+            ) {
+                Text(
+                    text = mode.label,
+                    color = Color.White,
+                    fontSize = 15.sp,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.padding(vertical = 10.dp),
+                )
+            }
         }
     }
 }

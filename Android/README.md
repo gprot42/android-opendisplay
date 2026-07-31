@@ -3,7 +3,7 @@
 Use an Android phone or tablet as a **second monitor** for a Mac running
 [OpenDisplay](https://github.com/peetzweg/opendisplay).
 
-Wi‑Fi only (same wire protocol as iOS — see [`WIRE.md`](../WIRE.md)).
+Same wire protocol as iOS — see [`WIRE.md`](../WIRE.md). **Network is the default**; USB is optional.
 
 ## What works
 
@@ -16,7 +16,9 @@ Wi‑Fi only (same wire protocol as iOS — see [`WIRE.md`](../WIRE.md)).
 | Mac cursor overlay (local cursor echo) | Works |
 | mDNS discovery (`_opensidecar._tcp`) | Works when the LAN allows multicast |
 | Manual IP connect (fallback) | Works |
-| USB (Apple usbmuxd) | Not supported — use Wi‑Fi or `adb reverse` |
+| **Network mode (default)** | Wi‑Fi / LAN |
+| **USB mode** | Cable + USB debugging; Mac **Android USB** uses `adb reverse` |
+| Background keep-alive | Foreground service; stream survives Home / recents |
 
 ## Supported Android versions
 
@@ -77,12 +79,22 @@ Needs **JDK 17+** and the Android SDK.
 
 ## Connect from the Mac
 
-1. Open this app (keep it in the foreground).
-2. Same Wi‑Fi as the Mac (or use the USB tip below).
-3. On the Mac: OpenDisplay → Wi‑Fi device, **or** manual host using the **IP:9000** on the idle screen.
+### Network (default)
+
+1. Open this app → leave **Network** selected.
+2. Same Wi‑Fi as the Mac.
+3. Mac OpenDisplay → pick the device, **or** manual **IP:9000** from the idle screen.
 4. Grant Mac **Screen Recording** + **Accessibility** if prompted.
 
-### USB power-user path
+### USB
+
+1. Enable **Developer options → USB debugging** on the phone.
+2. Open this app → choose **USB**.
+3. Plug into the Mac with a data cable; accept the debugging prompt if shown.
+4. Mac OpenDisplay → **Android USB** (needs [platform-tools](https://developer.android.com/tools/releases/platform-tools) `adb` on PATH or in the usual SDK location).
+5. OpenDisplay runs `adb reverse tcp:9000 tcp:9000` and dials `127.0.0.1:9000`.
+
+Manual equivalent:
 
 ```sh
 adb reverse tcp:9000 tcp:9000
