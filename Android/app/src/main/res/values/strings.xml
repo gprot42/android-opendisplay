@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">OpenDisplay</string>
+    <string name="waiting_for_mac">Waiting for Mac…</string>
+    <string name="listening">Listening on port %1$d</string>
+    <string name="connected">Connected</string>
+    <string name="streaming">Streaming</string>
+    <string name="mac_app_hint">Install OpenDisplay on your Mac, then connect over WiFi (or manual IP).</string>
+    <string name="service_name_label">Device name</string>
+</resources>

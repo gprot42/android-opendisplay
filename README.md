@@ -6,10 +6,10 @@
 
 **Turn your spare Apple devices into second monitors for your Mac — free, open source, no subscription.**
 
-iPhone and iPad today, spare MacBooks on the roadmap. A self-hosted
-alternative to Apple Sidecar, Duet Display, and Luna Display: true extended
-display (not just mirroring), Retina-sharp, over USB or WiFi, with touch and
-scroll input.
+iPhone and iPad today, **Android tablet (experimental, WiFi)** in this tree,
+spare MacBooks on the roadmap. A self-hosted alternative to Apple Sidecar,
+Duet Display, and Luna Display: true extended display (not just mirroring),
+Retina-sharp, over USB or WiFi, with touch and scroll input.
 
 [Website](https://peetzweg.github.io/opendisplay/) · [Quick start](#quick-start) · [How it works](#how-it-works) · [FAQ](#faq) · [Contributing](#contributing)
 
@@ -255,8 +255,24 @@ Tracked as [roadmap issues](https://github.com/peetzweg/opendisplay/issues?q=is%
 **Exploratory**
 - [#14](https://github.com/peetzweg/opendisplay/issues/14) Remote access beyond the local network
 - [#15](https://github.com/peetzweg/opendisplay/issues/15) Additional client platforms
+- Android tablet receiver (WiFi) — see [`Android/`](Android/) and [`WIRE.md`](WIRE.md)
 
 Done: prebuilt releases, built-in USB connectivity (no helper tools), WiFi via Bonjour, portrait mode, touch + two-finger scroll, performance overlay, iPad support, multiple devices at once ([#8](https://github.com/peetzweg/opendisplay/issues/8) — every connected device becomes its own extended display).
+
+## Android tablet (experimental)
+
+An early **Kotlin / Jetpack Compose** receiver lives in [`Android/`](Android/).
+It speaks the same protocol as the iOS app over **WiFi** (port 9000, Bonjour
+type `_opensidecar._tcp`). USB via Apple `usbmuxd` is not available; power users
+can `adb reverse tcp:9000 tcp:9000` and connect the Mac to `127.0.0.1:9000`.
+
+```sh
+cd Android
+./gradlew :app:assembleDebug
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+```
+
+Wire format for implementers: [`WIRE.md`](WIRE.md).
 
 ## Auto-update (macOS app)
 

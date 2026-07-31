@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Cleartext TCP on the LAN is intentional: same model as iOS WiFi mode.
+     Encryption is a separate roadmap item (OpenDisplay #16). -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>

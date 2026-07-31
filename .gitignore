@@ -38,3 +38,12 @@ fastlane/test_output/
 node_modules/
 dist-ssr/
 docs/
+
+# Android / Gradle
+Android/.gradle/
+Android/**/build/
+Android/local.properties
+Android/*.iml
+Android/.idea/
+*.apk
+*.aab
