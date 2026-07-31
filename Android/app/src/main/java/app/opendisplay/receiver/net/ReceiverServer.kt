@@ -190,6 +190,29 @@ class ReceiverServer(
         }
     }
 
+    /**
+     * Tell the Mac which fraction of the desktop is on screen (pinch-zoom).
+     * Mac crops ScreenCaptureKit to that rect and encodes it at full stream
+     * resolution so zoom stays sharp instead of magnifying compressed pixels.
+     *
+     * @param x,y top-left of visible region in normalized video space [0,1]
+     * @param w,h size of visible region in normalized video space
+     * @param z   pinch scale (≥ 1); used for bitrate boost
+     */
+    fun sendViewport(x: Double, y: Double, w: Double, h: Double, z: Double) {
+        scope.launch {
+            sendJson(
+                JSONObject()
+                    .put("type", WireMessage.VIEWPORT)
+                    .put("x", x)
+                    .put("y", y)
+                    .put("w", w)
+                    .put("h", h)
+                    .put("z", z),
+            )
+        }
+    }
+
     private suspend fun listenLoop() {
         while (scope.isActive && running) {
             try {
@@ -216,7 +239,10 @@ class ReceiverServer(
                         if (!running) break
                         throw e
                     }
-                    // Single client: replace any previous session.
+                    // Single client: the newest dial wins. (Do not "sticky-reject"
+                    // extras — if the Mac has already abandoned the old socket,
+                    // rejecting the new one leaves a zombie session with no
+                    // sender and a permanent connect/RST thrash.)
                     closeClient("replaced")
                     socket.tcpNoDelay = true
                     socket.keepAlive = true

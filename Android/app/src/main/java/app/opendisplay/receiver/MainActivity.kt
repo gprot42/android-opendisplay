@@ -62,6 +62,7 @@ class MainActivity : ComponentActivity() {
     @Volatile private var cursorView: CursorOverlayView? = null
     @Volatile private var videoView: TextureView? = null
     @Volatile private var videoSurface: Surface? = null
+    @Volatile private var latestViewport: TouchMapper.Viewport = TouchMapper.Viewport()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -98,16 +99,46 @@ class MainActivity : ComponentActivity() {
             },
             decoder = decoder,
             onCursor = { x, y, visible ->
-                cursorView?.setCursorPosition(x, y, visible)
+                // Mac cursor is full-desktop normalized. When zoomed, the stream
+                // is ROI-cropped to contentX/Y/W/H, so remap into that rect.
+                val vp = latestViewport
+                if (vp.scale <= 1.05f || vp.contentW <= 0.001f || vp.contentH <= 0.001f) {
+                    cursorView?.setCursorPosition(x, y, visible)
+                } else {
+                    val lx = (x - vp.contentX) / vp.contentW
+                    val ly = (y - vp.contentY) / vp.contentH
+                    val inView = lx in -0.05..1.05 && ly in -0.05..1.05
+                    cursorView?.setCursorPosition(
+                        lx.coerceIn(0.0, 1.0),
+                        ly.coerceIn(0.0, 1.0),
+                        visible && inView,
+                    )
+                }
             },
             onCursorImage = { png, nw, nh, ax, ay ->
-                cursorView?.setCursorSprite(png, nw, nh, ax, ay)
+                val vp = latestViewport
+                if (vp.scale <= 1.05f || vp.contentW <= 0.001f || vp.contentH <= 0.001f) {
+                    cursorView?.setCursorSprite(png, nw, nh, ax, ay)
+                } else {
+                    cursorView?.setCursorSprite(
+                        png,
+                        nw / vp.contentW.toDouble(),
+                        nh / vp.contentH.toDouble(),
+                        ax,
+                        ay,
+                    )
+                }
             },
             onCursorReset = {
                 cursorView?.clear()
             },
         )
         touchMapper = TouchMapper(this, server) { viewport ->
+            latestViewport = viewport
+            // Instant local pinch for feedback. The Mac ROI-crops capture to
+            // the same rect and re-encodes at full stream resolution, so after
+            // ~1 RTT the magnified region has real pixels (not just upscale).
+            // Local scale is eased so we don't fully double-zoom the ROI feed.
             applyViewport(viewport)
         }
         nsd = NsdAdvertiser(this)
@@ -166,15 +197,31 @@ class MainActivity : ComponentActivity() {
     private fun applyViewport(viewport: TouchMapper.Viewport) {
         val video = videoView ?: return
         val cursor = cursorView
-        // Scale around view center; pan via translation.
+        // Soft local scale: full response near 1× for snappy pinch; asymptote
+        // toward ~1.2× as logical zoom grows, because the Mac ROI stream
+        // already supplies the rest of the magnification as real pixels.
+        val local = softLocalScale(viewport.scale)
+        val panScale = if (viewport.scale > 1.01f) local / viewport.scale else 1f
         for (v in listOfNotNull(video, cursor)) {
             v.pivotX = v.width / 2f
             v.pivotY = v.height / 2f
-            v.scaleX = viewport.scale
-            v.scaleY = viewport.scale
-            v.translationX = viewport.panX
-            v.translationY = viewport.panY
+            v.scaleX = local
+            v.scaleY = local
+            v.translationX = viewport.panX * panScale
+            v.translationY = viewport.panY * panScale
         }
+    }
+
+    /**
+     * Brief local magnification for pinch feedback. Kept small because the Mac
+     * ROI stream already carries most of the zoom as real pixels; large local
+     * scale would double-zoom and reintroduce softness.
+     */
+    private fun softLocalScale(logical: Float): Float {
+        if (logical <= 1.01f) return 1f
+        // z=1.5 → ~1.12; z=2 → ~1.15; z=4 → ~1.18 (cap 1.2)
+        val t = ((logical - 1f) / 3f).coerceIn(0f, 1f)
+        return 1f + 0.2f * t
     }
 
     private fun updatePanelFromDisplay() {
@@ -335,7 +382,7 @@ private fun IdleOverlay(state: ReceiverUiState) {
         )
         Spacer(modifier = Modifier.height(12.dp))
         Text(
-            text = "Pinch to zoom · double-tap to reset · two-finger pan scrolls",
+            text = "Pinch to zoom (higher quality while zoomed) · double-tap to reset · two-finger pan scrolls",
             color = Color(0xFF6E6E6E),
             fontSize = 12.sp,
             textAlign = TextAlign.Center,

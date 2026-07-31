@@ -6,7 +6,12 @@
 
 **Android receiver only** — phone or tablet as a second Mac monitor over Wi‑Fi.
 
-Mac + iPhone/iPad apps: **[peetzweg/opendisplay](https://github.com/peetzweg/opendisplay)** · [Website](https://peetzweg.github.io/opendisplay/) · [Wire protocol](WIRE.md) · [Android details](Android/README.md)
+Mac + iPhone/iPad apps:
+
+- **[peetzweg/opendisplay](https://github.com/peetzweg/opendisplay)**
+- [Website](https://peetzweg.github.io/opendisplay/)
+- [Wire protocol](WIRE.md)
+- [Android details](Android/README.md)
 
 <br />
 

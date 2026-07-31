@@ -1,6 +1,9 @@
 package app.opendisplay.receiver.input
 
 import android.content.Context
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
 import android.view.GestureDetector
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
@@ -15,6 +18,10 @@ import kotlin.math.abs
  * - Zoomed: 1 finger = pan viewport; pinch = zoom; double-tap = reset
  * - Pinch keeps content under the focus point; pan is never gated on
  *   ScaleGestureDetector (which otherwise blocks two-finger translate).
+ *
+ * Zoom is also reported to the Mac (`viewport`) so capture can crop to the
+ * visible rect and re-encode it at full stream resolution — local scale alone
+ * only magnifies compressed pixels.
  */
 class TouchMapper(
     context: Context,
@@ -26,6 +33,14 @@ class TouchMapper(
         /** Pan in view pixels (translation after scale around view center). */
         val panX: Float = 0f,
         val panY: Float = 0f,
+        /**
+         * Visible region of the full desktop in normalized [0,1] video space
+         * (top-left + size). Full frame when scale == 1.
+         */
+        val contentX: Float = 0f,
+        val contentY: Float = 0f,
+        val contentW: Float = 1f,
+        val contentH: Float = 1f,
     )
 
     private var videoWidth = 1920
@@ -55,6 +70,10 @@ class TouchMapper(
 
     /** One-finger Mac drag in progress. */
     private var macDragging = false
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var lastViewportSentMs = 0L
+    private var pendingViewportSend: Runnable? = null
 
     private val scaleDetector = ScaleGestureDetector(
         context,
@@ -290,8 +309,58 @@ class TouchMapper(
         panY = panY.coerceIn(-maxPanY, maxPanY)
     }
 
+    /**
+     * Visible content rect in normalized video space for the current
+     * scale + pan (inverse of the view transform).
+     */
+    fun visibleContentRect(): FloatArray {
+        if (scale <= 1.01f || viewWidth <= 0 || viewHeight <= 0) {
+            return floatArrayOf(0f, 0f, 1f, 1f)
+        }
+        val (x0, y0) = screenToNormalized(0f, 0f)
+        val (x1, y1) = screenToNormalized(viewWidth.toFloat(), viewHeight.toFloat())
+        val left = minOf(x0, x1).toFloat().coerceIn(0f, 1f)
+        val top = minOf(y0, y1).toFloat().coerceIn(0f, 1f)
+        val right = maxOf(x0, x1).toFloat().coerceIn(0f, 1f)
+        val bottom = maxOf(y0, y1).toFloat().coerceIn(0f, 1f)
+        val w = (right - left).coerceAtLeast(0.02f)
+        val h = (bottom - top).coerceAtLeast(0.02f)
+        return floatArrayOf(left, top, w, h)
+    }
+
     private fun publishViewport() {
-        onViewportChanged(Viewport(scale, panX, panY))
+        val rect = visibleContentRect()
+        onViewportChanged(
+            Viewport(
+                scale = scale,
+                panX = panX,
+                panY = panY,
+                contentX = rect[0],
+                contentY = rect[1],
+                contentW = rect[2],
+                contentH = rect[3],
+            ),
+        )
+        scheduleViewportSend(rect)
+    }
+
+    /** Debounce Mac updates during a continuous pinch/pan (~30 Hz). */
+    private fun scheduleViewportSend(rect: FloatArray) {
+        pendingViewportSend?.let { mainHandler.removeCallbacks(it) }
+        val task = Runnable {
+            lastViewportSentMs = SystemClock.uptimeMillis()
+            server.sendViewport(
+                rect[0].toDouble(),
+                rect[1].toDouble(),
+                rect[2].toDouble(),
+                rect[3].toDouble(),
+                scale.toDouble(),
+            )
+        }
+        pendingViewportSend = task
+        val elapsed = SystemClock.uptimeMillis() - lastViewportSentMs
+        val delay = if (elapsed >= VIEWPORT_MIN_INTERVAL_MS) 0L else VIEWPORT_MIN_INTERVAL_MS - elapsed
+        mainHandler.postDelayed(task, delay)
     }
 
     private fun midpointX(e: MotionEvent): Float =
@@ -303,5 +372,6 @@ class TouchMapper(
     companion object {
         const val MIN_SCALE = 1f
         const val MAX_SCALE = 5f
+        private const val VIEWPORT_MIN_INTERVAL_MS = 33L
     }
 }

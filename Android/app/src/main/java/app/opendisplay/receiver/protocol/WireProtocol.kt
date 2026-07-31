@@ -28,4 +28,6 @@ object WireMessage {
     const val KF = "kf"
     const val CURSOR = "cursor"
     const val CURSOR_IMG = "cursorImg"
+    /** Visible content rect while pinch-zoomed — Mac crops capture for sharp zoom. */
+    const val VIEWPORT = "viewport"
 }

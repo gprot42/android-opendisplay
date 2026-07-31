@@ -178,6 +178,16 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private var helloContinuation: CheckedContinuation<PhoneInfo, Error>?
     private var inputInjector: InputInjector?
 
+    // Receiver pinch-zoom: crop capture to the visible rect and encode that
+    // region at full stream resolution so zoom stays sharp. Normalized
+    // top-left + size in video/display space; z is the pinch scale for bitrate.
+    private var receiverZoom: Double = 1
+    private var receiverViewport = CGRect(x: 0, y: 0, width: 1, height: 1) // normalized
+    private var captureWidth = 0
+    private var captureHeight = 0
+    private var captureConfig: SCStreamConfiguration?
+    private var lastViewportApply = Date.distantPast
+
     // Liveness: both sides ping every 2s; if nothing arrives for 5s the link
     // is half-open (e.g. usbmuxd accepted but the device is gone) — reconnect.
     private var lastReceived = Date()
@@ -252,14 +262,15 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             scheduleWatchdog()
         }
 
-        // Screen Recording permission: poll until granted. No auto-prompt at
-        // launch — the permission panel's Grant button triggers the system
-        // dialog, so the request always has visible context.
+        // Screen Recording is required for both mirror and extend. Prompt once
+        // here (in addition to the Permissions panel) so a fresh debug build
+        // that lost TCC after re-sign is not stuck "Connected" with fps=0.
         if !CGPreflightScreenCaptureAccess() {
-            await status("Screen Recording permission needed — see Permissions below")
-            Log.info("Screen Recording permission missing — waiting for grant via the permission panel")
+            await status("Screen Recording permission needed — click Allow or enable in System Settings")
+            Log.info("Screen Recording permission missing — requesting access")
+            CGRequestScreenCaptureAccess()
             while !CGPreflightScreenCaptureAccess() {
-                try await Task.sleep(for: .seconds(2))
+                try await Task.sleep(for: .seconds(1))
                 if stopped { return }
             }
             Log.info("Screen Recording permission granted")
@@ -455,6 +466,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // the encoder for ~13ms — headroom prevents SCK starvation drops.
         config.queueDepth = 8
         config.showsCursor = !localCursor
+        applySourceRect(to: config, displayID: display.displayID)
 
         setupEncoder(width: pixelsWide, height: pixelsHigh)
 
@@ -462,6 +474,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
         try await stream.startCapture()
         self.stream = stream
+        self.captureConfig = config
+        self.captureWidth = pixelsWide
+        self.captureHeight = pixelsHigh
         captureDisplayID = display.displayID
         lastCursorPNGHash = 0      // rotation rebuilds: re-send the sprite
         lastCursorSent = (-1, -1, false)
@@ -469,6 +484,116 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         Log.info("capture started: \(pixelsWide)x\(pixelsHigh) display \(display.displayID) mode \(mode.rawValue) localCursor=\(localCursor)")
         let kind = lastHello?.kind ?? "device"
         await status("\(mode == .extend ? "Extending to" : "Mirroring to") \(kind) (\(pixelsWide)×\(pixelsHigh))")
+    }
+
+    /// Map the receiver's normalized visible rect onto the capture display
+    /// in points (ScreenCaptureKit `sourceRect` space).
+    private func applySourceRect(to config: SCStreamConfiguration, displayID: CGDirectDisplayID) {
+        let bounds = CGDisplayBounds(displayID)
+        guard bounds.width > 1, bounds.height > 1 else {
+            config.sourceRect = .null
+            return
+        }
+        let vp = receiverViewport
+        if receiverZoom <= 1.02 || (vp.width >= 0.98 && vp.height >= 0.98) {
+            config.sourceRect = .null
+            return
+        }
+        let nx = min(max(vp.origin.x, 0), 0.95)
+        let ny = min(max(vp.origin.y, 0), 0.95)
+        let nw = min(max(vp.width, 0.05), 1 - nx)
+        let nh = min(max(vp.height, 0.05), 1 - ny)
+        config.sourceRect = CGRect(
+            x: bounds.minX + nx * bounds.width,
+            y: bounds.minY + ny * bounds.height,
+            width: nw * bounds.width,
+            height: nh * bounds.height
+        )
+    }
+
+    /// Receiver pinch-zoom: ROI-crop capture to the visible rect (encoded at
+    /// full stream resolution → real pixels under the magnifier) and raise
+    /// bitrate. The Android UI keeps a local View scale for instant feedback;
+    /// that scale is modest so it does not fully double-zoom the ROI stream.
+    private func handleReceiverViewport(x: Double, y: Double, w: Double, h: Double, z: Double) {
+        let zoom = max(1.0, min(z, 5.0))
+        let rect = CGRect(
+            x: min(max(x, 0), 1),
+            y: min(max(y, 0), 1),
+            width: min(max(w, 0.05), 1),
+            height: min(max(h, 0.05), 1)
+        )
+        let zoomChanged = abs(zoom - receiverZoom) > 0.03
+        let rectChanged = abs(rect.origin.x - receiverViewport.origin.x) > 0.002
+            || abs(rect.origin.y - receiverViewport.origin.y) > 0.002
+            || abs(rect.width - receiverViewport.width) > 0.002
+            || abs(rect.height - receiverViewport.height) > 0.002
+        guard zoomChanged || rectChanged else { return }
+
+        receiverZoom = zoom
+        receiverViewport = rect
+
+        let now = Date()
+        if now.timeIntervalSince(lastViewportApply) < 0.04 {
+            queue.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+                self?.applyViewportToStream()
+            }
+            return
+        }
+        applyViewportToStream()
+    }
+
+    private func applyViewportToStream() {
+        guard !stopped, let stream, let base = captureConfig, captureDisplayID != 0 else {
+            applyZoomBitrate(forceKeyframe: true)
+            return
+        }
+        lastViewportApply = Date()
+
+        let config = SCStreamConfiguration()
+        config.width = base.width
+        config.height = base.height
+        config.minimumFrameInterval = base.minimumFrameInterval
+        config.pixelFormat = base.pixelFormat
+        config.queueDepth = base.queueDepth
+        config.showsCursor = base.showsCursor
+        applySourceRect(to: config, displayID: captureDisplayID)
+
+        Task {
+            do {
+                try await stream.updateConfiguration(config)
+                self.queue.async {
+                    self.captureConfig = config
+                    self.needsKeyframe = true
+                    self.applyZoomBitrate(forceKeyframe: false)
+                    Log.info(String(
+                        format: "viewport zoom=%.2f crop=(%.2f,%.2f %.2f×%.2f) bitrate boost",
+                        self.receiverZoom,
+                        self.receiverViewport.origin.x, self.receiverViewport.origin.y,
+                        self.receiverViewport.width, self.receiverViewport.height
+                    ))
+                }
+            } catch {
+                Log.info("viewport update failed: \(error.localizedDescription)")
+                self.queue.async { self.applyZoomBitrate(forceKeyframe: true) }
+            }
+        }
+    }
+
+    /// Raise average bitrate with zoom so magnified regions keep detail.
+    private func applyZoomBitrate(forceKeyframe: Bool = false) {
+        guard let encoder else { return }
+        let z = min(max(receiverZoom, 1), 4)
+        // Super-linear enough to fight upscale softness; hard-capped for Wi‑Fi.
+        let factor = 1.0 + (z - 1.0) * 1.5
+        let br = min(Int(Double(quality.bitrate) * factor), 40_000_000)
+        VTSessionSetProperty(encoder, key: kVTCompressionPropertyKey_AverageBitRate, value: br as CFNumber)
+        VTSessionSetProperty(
+            encoder,
+            key: kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality,
+            value: z > 1.15 ? kCFBooleanFalse : kCFBooleanTrue
+        )
+        if forceKeyframe { needsKeyframe = true }
     }
 
     func stop() {
@@ -510,7 +635,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             self.disconnectedSince = Date()
             self.connectionReady = false
             self.dialGeneration += 1   // a dial still in flight must not adopt
-            self.connection?.cancel()
+            if let previous = self.connection {
+                previous.stateUpdateHandler = nil
+                previous.cancel()
+            }
             self.connection = nil
             self.pendingSends = 0
             self.pipelineLock.lock()
@@ -610,6 +738,14 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
     /// Bookkeeping shared by both transports once a connection is live.
     private func becomeReady(_ conn: NWConnection) {
+        // Ignore late `.ready` from a superseded dial.
+        guard connection === conn else { return }
+        // Network.framework can re-enter `.ready` after path updates; only
+        // arm the receive loop once per connection.
+        if connectionReady, connection === conn {
+            lastReceived = Date()
+            return
+        }
         Log.info("connection ready to \(endpointName)")
         connectionReady = true
         everConnected = true
@@ -632,7 +768,23 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private func connectTCP(_ endpoint: NWEndpoint) {
         let options = NWProtocolTCP.Options()
         options.noDelay = true   // latency matters more than throughput here
+        // Prefer a single path: multipath / Happy Eyeballs racing two
+        // addresses (link-local + global IPv6) used to leave an orphan TCP
+        // half-open on the receiver, which then "replaced" the live session
+        // and thrashed both ends in a connect/RST loop.
         let params = NWParameters(tls: nil, tcp: options)
+        params.allowLocalEndpointReuse = true
+        params.multipathServiceType = .disabled
+
+        // Always retire the previous dial before opening another — otherwise
+        // its stateUpdateHandler can still fire `.failed` and schedule a
+        // reconnect that cancels the connection that just became ready.
+        if let previous = connection {
+            previous.stateUpdateHandler = nil
+            previous.cancel()
+            connection = nil
+        }
+
         let conn = NWConnection(to: endpoint, using: params)
         connection = conn
         // A dial to a withdrawn Bonjour service (receiver asleep or app
@@ -650,6 +802,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         conn.stateUpdateHandler = { [weak self] state in
             guard let self else { return }
+            // Ignore events from a superseded dial — an orphan's `.failed`
+            // must not cancel the live socket and restart the thrash loop.
+            guard self.connection === conn else { return }
             switch state {
             case .ready:
                 self.becomeReady(conn)
@@ -661,20 +816,24 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 }
                 self.scheduleReconnect()
             case .waiting(let error):
-                // On loopback there is no "path change" to wake us up again
-                // (e.g. a manual -host tunnel not started yet) — treat
-                // waiting as failure and poll by reconnecting.
-                Log.info("connection waiting: \(error) — will retry")
-                self.connectionReady = false
-                // Read the queue-confined flag here (handler runs on queue),
-                // not inside the detached status Task.
-                let text = self.awaitingWake
-                    ? "\(self.endpointName) is asleep — reconnects when it wakes…"
-                    : "Waiting for receiver at \(self.endpointName)…"
-                Task { await self.status(text) }
-                self.scheduleReconnect()
+                // Bonjour dials often pass through `.waiting` before `.ready`.
+                // Do NOT cancel+redial here — that races the first dial and
+                // leaves an orphan TCP on the receiver (connect/RST thrash).
+                // The 5s dial timeout above handles dials that never leave
+                // waiting; loopback "tunnel not up yet" also hits that path.
+                Log.info("connection waiting: \(error)")
+                if !self.connectionReady {
+                    let text = self.awaitingWake
+                        ? "\(self.endpointName) is asleep — reconnects when it wakes…"
+                        : "Waiting for receiver at \(self.endpointName)…"
+                    Task { await self.status(text) }
+                }
             case .cancelled:
-                self.connectionReady = false
+                // Only clear ready if this cancelled conn is still current
+                // (always true due to the guard above).
+                if self.connection === conn {
+                    self.connectionReady = false
+                }
             default:
                 break
             }
@@ -753,7 +912,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         connectionReady = false
         dialGeneration += 1   // a USB dial still in flight must not adopt
         let generation = dialGeneration
-        connection?.cancel()
+        if let previous = connection {
+            previous.stateUpdateHandler = nil
+            previous.cancel()
+        }
         connection = nil
         pendingSends = 0
         pipelineLock.lock()
@@ -968,17 +1130,44 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 if let continuation = helloContinuation {
                     helloContinuation = nil
                     continuation.resume(returning: info)
-                } else if mode == .extend, stream != nil, let previous,
-                          previous.pixelsWide != info.pixelsWide
-                          || previous.pixelsHigh != info.pixelsHigh {
-                    // Phone rotated — rebuild after a short debounce so a
-                    // flurry of orientation flips settles into one rebuild.
-                    Task {
-                        try? await Task.sleep(for: .milliseconds(300))
-                        guard let current = self.lastHello,
-                              current.pixelsWide == info.pixelsWide,
-                              current.pixelsHigh == info.pixelsHigh else { return }
-                        await self.reconfigure(info)
+                } else if mode == .extend {
+                    // start() may have failed (e.g. virtual display serial
+                    // still held) while the TCP reconnect loop kept running.
+                    // A later hello should (re)build the pipeline rather than
+                    // leave the session stuck "Connected" with no capture.
+                    // Skip while Screen Recording is still missing — start()
+                    // owns that poll and will call setupExtend after grant.
+                    // `reconfiguring` also covers "setup still in flight".
+                    if stream == nil, !reconfiguring, CGPreflightScreenCaptureAccess() {
+                        Task {
+                            guard !self.stopped, self.stream == nil, !self.reconfiguring,
+                                  CGPreflightScreenCaptureAccess() else { return }
+                            self.reconfiguring = true
+                            defer { self.reconfiguring = false }
+                            // Drop any partial display from a prior failed attempt
+                            // so the serial is free for the retry.
+                            if let stream = self.stream { try? await stream.stopCapture() }
+                            self.stream = nil
+                            self.virtualDisplay = nil
+                            do {
+                                try await self.setupExtend(info)
+                            } catch {
+                                Log.info("late setupExtend failed: \(error)")
+                                await self.status("Failed: \(error.localizedDescription)")
+                            }
+                        }
+                    } else if stream != nil, let previous,
+                              previous.pixelsWide != info.pixelsWide
+                              || previous.pixelsHigh != info.pixelsHigh {
+                        // Phone rotated — rebuild after a short debounce so a
+                        // flurry of orientation flips settles into one rebuild.
+                        Task {
+                            try? await Task.sleep(for: .milliseconds(300))
+                            guard let current = self.lastHello,
+                                  current.pixelsWide == info.pixelsWide,
+                                  current.pixelsHigh == info.pixelsHigh else { return }
+                            await self.reconfigure(info)
+                        }
                     }
                 }
             }
@@ -1004,6 +1193,15 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             // periodic keyframes are off) — force an IDR on the next frame.
             Log.info("phone requested keyframe")
             needsKeyframe = true
+        case "viewport":
+            // Android pinch-zoom: crop capture to the visible rect so the
+            // stream carries real pixels instead of a soft local upscale.
+            let x = obj["x"] as? Double ?? 0
+            let y = obj["y"] as? Double ?? 0
+            let w = obj["w"] as? Double ?? 1
+            let h = obj["h"] as? Double ?? 1
+            let z = obj["z"] as? Double ?? 1
+            handleReceiverViewport(x: x, y: y, w: w, h: h, z: z)
         case WireMessage.sleeping:
             // The device locked and is about to close on us. Hand the
             // session to the controller right away: it tears the virtual
@@ -1072,6 +1270,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         VTSessionSetProperty(encoder, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: 60 as CFNumber)
         VTSessionSetProperty(encoder, key: kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, value: kCFBooleanTrue)
         VTCompressionSessionPrepareToEncodeFrames(encoder)
+        // Re-apply zoom bitrate if the receiver is already pinched in.
+        if receiverZoom > 1.02 { applyZoomBitrate(forceKeyframe: false) }
         Log.info("encoder ready: \(width)x\(height) H.264 \(quality.bitrate / 1_000_000)Mbps quality=\(quality.rawValue) lowLatencyRC=\(lowLatency)")
     }
 

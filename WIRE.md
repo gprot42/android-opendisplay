@@ -159,6 +159,22 @@ See iOS `PhoneReceiver` for the current set (`fps`, `mbps`, `e2e50`, …).
 Ask the Mac for an IDR (and SPS/PPS) on the next frame — use after decoder
 reset or attach mid-GOP.
 
+### `viewport` (optional; Android pinch-zoom)
+
+```json
+{"type":"viewport","x":0.25,"y":0.25,"w":0.5,"h":0.5,"z":2.0}
+```
+
+| Field | Notes |
+|---|---|
+| `x`,`y` | Top-left of the visible region in normalized **full-desktop** space `[0,1]` |
+| `w`,`h` | Size of the visible region in the same space |
+| `z` | Pinch scale (≥ 1) |
+| Mac | ROI-crops ScreenCaptureKit to this rect (full encode size → sharp zoom) and raises bitrate |
+
+Older Mac builds ignore unknown types. Send on pinch/pan (debounced); send
+`z:1, x:0, y:0, w:1, h:1` on reset.
+
 ### `sleeping` / `closing`
 
 ```json
