@@ -39,6 +39,7 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
+import app.opendisplay.receiver.compat.DeviceReport
 import app.opendisplay.receiver.input.TouchMapper
 import app.opendisplay.receiver.net.NsdAdvertiser
 import app.opendisplay.receiver.net.PanelInfo
@@ -65,6 +66,17 @@ class MainActivity : ComponentActivity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
         val app = application as OpenDisplayApp
+        val deviceInfo = DeviceReport.collect()
+        DeviceReport.logOnce()
+        if (!deviceInfo.hasAvcDecoder) {
+            uiState.value = uiState.value.copy(
+                status = "No H.264 decoder on this device — cannot stream",
+                deviceSummary = deviceInfo.summaryLine(),
+            )
+        } else {
+            uiState.value = uiState.value.copy(deviceSummary = deviceInfo.summaryLine())
+        }
+
         decoder = H264Decoder(
             onNeedKeyframe = {
                 if (::server.isInitialized) server.requestKeyframe()
@@ -76,7 +88,11 @@ class MainActivity : ComponentActivity() {
         )
         server = ReceiverServer(
             installId = app.installId,
-            onState = { uiState.value = it },
+            onState = { next ->
+                uiState.value = next.copy(
+                    deviceSummary = next.deviceSummary.ifEmpty { deviceInfo.summaryLine() },
+                )
+            },
             decoder = decoder,
             onCursor = { x, y, visible ->
                 cursorView?.setCursorPosition(x, y, visible)
@@ -283,5 +299,15 @@ private fun IdleOverlay(state: ReceiverUiState) {
             color = Color(0xFF6E6E6E),
             fontSize = 12.sp,
         )
+        if (state.deviceSummary.isNotEmpty()) {
+            Spacer(Modifier.height(16.dp))
+            Text(
+                text = state.deviceSummary,
+                color = Color(0xFF555555),
+                fontFamily = FontFamily.Monospace,
+                fontSize = 11.sp,
+                textAlign = TextAlign.Center,
+            )
+        }
     }
 }

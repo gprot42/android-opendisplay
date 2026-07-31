@@ -5,9 +5,18 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <!-- Android 13+ (API 33): helps Wi‑Fi / mDNS peer features on some OEMs. -->
+    <uses-permission
+        android:name="android.permission.NEARBY_WIFI_DEVICES"
+        android:minSdkVersion="33"
+        android:usesPermissionFlags="neverForLocation" />
 
+    <!-- Any device with a network + H.264 decoder; phone or tablet. -->
     <uses-feature
         android:name="android.hardware.touchscreen"
+        android:required="false" />
+    <uses-feature
+        android:name="android.hardware.wifi"
         android:required="false" />
     <uses-feature
         android:name="android.software.leanback"

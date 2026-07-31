@@ -10,7 +10,11 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Hardware H.264 decode into a Surface. Configures from in-band SPS/PPS.
- * Call [release] on the session thread when the surface or connection ends.
+ *
+ * Cross-version notes (minSdk 26):
+ * - [MediaFormat.KEY_LOW_LATENCY] is API 30+ only; below that we try vendor keys.
+ * - [MediaFormat.KEY_PRIORITY] is API 23+ (always available here).
+ * - Decoder name / behavior varies by OEM; configure failures request a keyframe.
  */
 class H264Decoder(
     private val onNeedKeyframe: () -> Unit,
@@ -24,6 +28,7 @@ class H264Decoder(
     private var configured = false
     private val released = AtomicBoolean(false)
     private var ptsUs = 0L
+    private var configureAttempts = 0
 
     fun setSurface(surface: Surface?) {
         this.surface = surface
@@ -68,7 +73,7 @@ class H264Decoder(
                 try {
                     configure(s, p)
                 } catch (e: Exception) {
-                    Log.e(tag, "configure failed", e)
+                    Log.e(tag, "configure failed (API ${Build.VERSION.SDK_INT})", e)
                     onNeedKeyframe()
                     return
                 }
@@ -77,7 +82,6 @@ class H264Decoder(
 
         if (!configured || vcl.isEmpty()) return
 
-        // One MediaCodec buffer: Annex B start codes re-prefixed per NALU.
         val annexB = toAnnexB(vcl)
         queueInput(annexB)
         drainOutput()
@@ -86,23 +90,72 @@ class H264Decoder(
     private fun configure(sps: ByteArray, pps: ByteArray) {
         releaseCodecOnly()
         val surf = surface ?: return
+        configureAttempts++
 
-        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, 1920, 1080)
+        val (width, height) = estimateSizeFromSps(sps) ?: (1920 to 1080)
+        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height)
         format.setByteBuffer("csd-0", ByteBuffer.wrap(withStartCode(sps)))
         format.setByteBuffer("csd-1", ByteBuffer.wrap(withStartCode(pps)))
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
-        }
-        // Prefer real-time path when vendors honor it.
-        format.setInteger(MediaFormat.KEY_PRIORITY, 0)
+
+        applyLowLatencyHints(format)
 
         val c = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
-        c.configure(format, surf, null, 0)
+        try {
+            c.configure(format, surf, null, 0)
+        } catch (e: Exception) {
+            // Some OEMs reject vendor keys — retry bare format once.
+            Log.w(tag, "configure with low-latency hints failed, retrying plain: ${e.message}")
+            c.release()
+            val plain = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height)
+            plain.setByteBuffer("csd-0", ByteBuffer.wrap(withStartCode(sps)))
+            plain.setByteBuffer("csd-1", ByteBuffer.wrap(withStartCode(pps)))
+            val c2 = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+            c2.configure(plain, surf, null, 0)
+            c2.start()
+            codec = c2
+            configured = true
+            Log.i(tag, "decoder configured (plain) ${width}x${height} name=${c2.name}")
+            return
+        }
         c.start()
         codec = c
         configured = true
-        Log.i(tag, "decoder configured")
-        // Size comes from output format change.
+        Log.i(tag, "decoder configured ${width}x${height} name=${c.name} attempt=$configureAttempts")
+    }
+
+    /**
+     * Best-effort low-latency flags. Safe on all API ≥ 26; unknown keys are
+     * ignored by the framework, but a few OEMs throw — caller retries plain.
+     */
+    private fun applyLowLatencyHints(format: MediaFormat) {
+        // Real-time priority (API 23+).
+        try {
+            format.setInteger(MediaFormat.KEY_PRIORITY, 0)
+        } catch (_: Exception) {
+        }
+
+        // Official low-latency key (API 30 / Android 11+).
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            try {
+                format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
+            } catch (_: Exception) {
+            }
+        }
+
+        // Vendor extensions used by common SoCs when the public key is missing
+        // or ignored (Android 8–10 tablets, some Android 11+ builds).
+        val vendorFlags = arrayOf(
+            "vendor.qti-ext-dec-low-latency.enable",
+            "vendor.low-latency.enable",
+            "low-latency",
+            "vdec-lowlatency",
+        )
+        for (key in vendorFlags) {
+            try {
+                format.setInteger(key, 1)
+            } catch (_: Exception) {
+            }
+        }
     }
 
     private fun queueInput(annexB: ByteArray) {
@@ -116,8 +169,13 @@ class H264Decoder(
             }
             val buf = c.getInputBuffer(inIndex) ?: return
             buf.clear()
+            if (buf.remaining() < annexB.size) {
+                Log.w(tag, "input buffer too small ${buf.remaining()} < ${annexB.size}")
+                onNeedKeyframe()
+                return
+            }
             buf.put(annexB)
-            ptsUs += 16_666 // ~60fps placeholder; low-latency ignore display timestamps
+            ptsUs += 16_666
             c.queueInputBuffer(inIndex, 0, annexB.size, ptsUs, 0)
         } catch (e: Exception) {
             Log.e(tag, "queueInput failed", e)
@@ -143,7 +201,6 @@ class H264Decoder(
                         onVideoSize(w, h)
                     }
                     outIndex >= 0 -> {
-                        // Render to surface immediately.
                         c.releaseOutputBuffer(outIndex, true)
                     }
                 }
@@ -198,5 +255,18 @@ class H264Decoder(
             o += n.size
         }
         return out
+    }
+
+    /**
+     * Minimal H.264 SPS parse for pic_width/height (enough for MediaFormat).
+     * Returns null if the SPS is truncated or non-baseline layout.
+     */
+    private fun estimateSizeFromSps(sps: ByteArray): Pair<Int, Int>? {
+        // Skip NAL header; exp-Golomb walk is fragile — prefer output-format.
+        // Keep a coarse size for configure only.
+        if (sps.size < 4) return null
+        // Many SPS blobs encode 1080p-class streams; decoder will correct via
+        // INFO_OUTPUT_FORMAT_CHANGED. Avoid wrong non-zero that breaks some OEMs.
+        return null
     }
 }

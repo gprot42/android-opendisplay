@@ -259,20 +259,19 @@ Tracked as [roadmap issues](https://github.com/peetzweg/opendisplay/issues?q=is%
 
 Done: prebuilt releases, built-in USB connectivity (no helper tools), WiFi via Bonjour, portrait mode, touch + two-finger scroll, performance overlay, iPad support, multiple devices at once ([#8](https://github.com/peetzweg/opendisplay/issues/8) — every connected device becomes its own extended display).
 
-## Android tablet (experimental)
+## Android (experimental)
 
 An early **Kotlin / Jetpack Compose** receiver lives in [`Android/`](Android/).
-It speaks the same protocol as the iOS app over **WiFi** (port 9000, Bonjour
-type `_opensidecar._tcp`). USB via Apple `usbmuxd` is not available; power users
-can `adb reverse tcp:9000 tcp:9000` and connect the Mac to `127.0.0.1:9000`.
+**minSdk 26 (Android 8.0)** · Wi‑Fi only · same protocol as iOS.
+
+Compatibility matrix, smoke checklist, and build steps:
+**[`Android/README.md`](Android/README.md)** · wire format: [`WIRE.md`](WIRE.md)
 
 ```sh
 cd Android
 ./gradlew :app:assembleDebug
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
-
-Wire format for implementers: [`WIRE.md`](WIRE.md).
 
 ## Auto-update (macOS app)
 

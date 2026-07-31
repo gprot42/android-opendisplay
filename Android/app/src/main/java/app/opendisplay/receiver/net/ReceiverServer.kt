@@ -45,6 +45,8 @@ data class ReceiverUiState(
     val localAddresses: List<String> = emptyList(),
     val port: Int = WireProtocol.DEFAULT_PORT,
     val serviceName: String = "OpenDisplay",
+    /** e.g. "Android 15 (API 35) · Pixel Tablet" for support reports. */
+    val deviceSummary: String = "",
 )
 
 /**
@@ -119,12 +121,11 @@ class ReceiverServer(
         decoder.release()
         scope.cancel()
         publish(
-            ReceiverUiState(
+            state.copy(
                 status = "Stopped",
                 listening = false,
                 connected = false,
-                port = port,
-                serviceName = serviceName,
+                streaming = false,
             ),
         )
     }
