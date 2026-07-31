@@ -28,7 +28,7 @@ Free, open source, no subscription — alternative to Sidecar / Duet / Luna on h
 ## Features
 
 - True display extension (or mirror) via Mac OpenDisplay
-- **Network (Wi‑Fi) by default** · optional **USB** via `adb reverse`
+- **Network (Wi‑Fi) by default** · optional **USB** via `adb forward`
 - Hardware H.264 decode · touch + two-finger scroll · pinch-to-zoom · cursor overlay
 - Portrait / landscape · mDNS discovery + manual IP · stays running in background
 
@@ -43,7 +43,7 @@ Free, open source, no subscription — alternative to Sidecar / Duet / Luna on h
 | mDNS (`_opensidecar._tcp`) | ✅ when LAN allows multicast |
 | Manual IP connect | ✅ |
 | **Network mode (default)** | ✅ Wi‑Fi / LAN |
-| **USB mode** | ✅ cable + USB debugging; Mac **Android USB** runs `adb reverse` |
+| **USB mode** | ✅ cable + USB debugging; Mac **Android USB** runs `adb forward` |
 | Background keep-alive | ✅ foreground service (session survives Home) |
 
 ## Android versions
@@ -67,7 +67,7 @@ Free, open source, no subscription — alternative to Sidecar / Duet / Luna on h
 
 | Device | Android | Result |
 |---|---|---|
-| Pixel 10 Pro XL | 16 / API 36 | Stream + touch + cursor (Wi‑Fi) |
+| Pixel 10 Pro XL | 16 / API 36 | Stream + touch + cursor (Wi‑Fi + USB via `adb forward`) |
 
 More devices: PR welcome — model, Android version, pass/fail.
 
@@ -89,7 +89,7 @@ Needs JDK 17+ and the Android SDK. Details: [`Android/README.md`](Android/README
 1. Open the Android app.
 2. **Network (default):** same Wi‑Fi → Mac OpenDisplay → pick the device (or **IP:9000**).
 3. **USB:** phone **USB** mode + USB debugging + cable → Mac OpenDisplay → **Android USB**
-   (requires `adb` on the Mac; OpenDisplay runs `adb reverse` for you).
+   (requires `adb` on the Mac; OpenDisplay runs `adb forward` for you).
 4. Grant Mac **Screen Recording** + **Accessibility** if prompted.
 
 ## How it works

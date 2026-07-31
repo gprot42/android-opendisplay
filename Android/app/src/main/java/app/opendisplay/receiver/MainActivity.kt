@@ -235,7 +235,7 @@ class MainActivity : ComponentActivity() {
                 nsd.register(name, WireProtocol.DEFAULT_PORT, (application as OpenDisplayApp).installId)
             }
             ConnectionMode.USB -> {
-                // Mac reaches us via adb reverse → 127.0.0.1:9000; mDNS is optional noise.
+                // Mac reaches us via adb forward → device :9000; mDNS is optional noise.
                 nsd.unregister()
             }
         }
@@ -478,7 +478,7 @@ private fun IdleOverlay(
                     text = "1. Enable USB debugging on this phone\n" +
                         "2. Plug into the Mac with a data cable\n" +
                         "3. Mac OpenDisplay → Android USB\n" +
-                        "   (runs adb reverse to port ${state.port})",
+                        "   (runs adb forward to port ${state.port})",
                     color = Color(0xFF9E9E9E),
                     fontSize = 14.sp,
                     textAlign = TextAlign.Center,

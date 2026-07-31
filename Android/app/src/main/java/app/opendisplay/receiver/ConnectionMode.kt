@@ -4,7 +4,7 @@ import android.content.Context
 
 /**
  * How the Mac reaches this receiver. Network (Wi‑Fi / LAN) is the default;
- * USB uses a cable + `adb reverse` (or USB tethering) on the Mac side.
+ * USB uses a cable + `adb forward` (or USB tethering) on the Mac side.
  */
 enum class ConnectionMode {
     NETWORK,

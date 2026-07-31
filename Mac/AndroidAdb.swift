@@ -1,8 +1,13 @@
 import Foundation
 
-/// Android USB path: reverse TCP via the platform `adb` tool, then the Mac
+/// Android USB path: TCP forward via the platform `adb` tool, then the Mac
 /// dials loopback. Network/Wi‑Fi remains the default discovery path; this is
 /// only used when the user picks **Android USB**.
+///
+/// Direction matters: the phone **listens** on :9000 and the Mac **connects**.
+/// That is `adb forward` (host → device), not `adb reverse` (device → host).
+/// Reverse fails while the app is listening because the device port is already
+/// bound — the classic “USB not working” symptom on Pixel / Android 16.
 enum AndroidAdb {
     /// Cached path to adb, or empty if not found.
     private static let adbPath: String? = {
@@ -56,25 +61,49 @@ enum AndroidAdb {
         return "Android USB (\(serials.count) devices)"
     }
 
-    /// `adb [-s serial] reverse tcp:PORT tcp:PORT` so Mac → 127.0.0.1:PORT reaches the phone.
+    /// `adb [-s serial] forward tcp:HOST tcp:DEVICE` so Mac → `127.0.0.1:HOST`
+    /// reaches the phone’s listen port. Prefers the same host port as the
+    /// device; falls back if the host port is already taken.
+    ///
+    /// - Returns: Host port to dial on loopback, or `nil` if setup failed.
     @discardableResult
-    static func reverse(port: UInt16, serial: String? = nil) -> Bool {
+    static func forward(devicePort: UInt16, serial: String? = nil) -> UInt16? {
         guard let adb = adbPath else {
             Log.info("adb not found — install platform-tools for Android USB")
-            return false
+            return nil
         }
         let serials = deviceSerials()
         guard !serials.isEmpty else {
             Log.info("adb: no device in 'device' state")
-            return false
+            return nil
         }
         let target = serial.flatMap { serials.contains($0) ? $0 : nil } ?? serials[0]
-        // Remove any stale reverse, then set fresh.
-        _ = shell("\(adb) -s \(target) reverse --remove tcp:\(port)")
-        let out = shell("\(adb) -s \(target) reverse tcp:\(port) tcp:\(port)")
-        let ok = !out.lowercased().contains("error") && !out.lowercased().contains("failed")
-        Log.info("adb reverse tcp:\(port) on \(target): \(ok ? "ok" : out)")
-        return ok
+
+        // Prefer matching ports; fall back when something else owns the host
+        // listen socket (another tool, leftover forward, etc.).
+        let hostCandidates: [UInt16] = [devicePort, 19_000, 19_001, 29_000]
+        for hostPort in hostCandidates {
+            _ = shell("\(adb) -s \(target) forward --remove tcp:\(hostPort)")
+            let out = shell("\(adb) -s \(target) forward tcp:\(hostPort) tcp:\(devicePort)")
+            let lower = out.lowercased()
+            let ok = !lower.contains("error") && !lower.contains("failed")
+                && !lower.contains("cannot bind")
+            if ok {
+                Log.info("adb forward tcp:\(hostPort) → device tcp:\(devicePort) on \(target): ok")
+                return hostPort
+            }
+            Log.info("adb forward tcp:\(hostPort) on \(target) failed: \(out.trimmingCharacters(in: .whitespacesAndNewlines))")
+        }
+        return nil
+    }
+
+    /// Legacy name — calls ``forward(devicePort:serial:)`` and returns whether
+    /// a host port was installed. Prefer ``forward`` so callers dial the
+    /// returned host port (which may differ from the device port).
+    @discardableResult
+    @available(*, deprecated, renamed: "forward(devicePort:serial:)")
+    static func reverse(port: UInt16, serial: String? = nil) -> Bool {
+        forward(devicePort: port, serial: serial) != nil
     }
 
     private static func prop(serial: String, key: String) -> String? {

@@ -17,7 +17,7 @@ Same wire protocol as iOS — see [`WIRE.md`](../WIRE.md). **Network is the defa
 | mDNS discovery (`_opensidecar._tcp`) | Works when the LAN allows multicast |
 | Manual IP connect (fallback) | Works |
 | **Network mode (default)** | Wi‑Fi / LAN |
-| **USB mode** | Cable + USB debugging; Mac **Android USB** uses `adb reverse` |
+| **USB mode** | Cable + USB debugging; Mac **Android USB** uses `adb forward` |
 | Background keep-alive | Foreground service; stream survives Home / recents |
 
 ## Supported Android versions
@@ -53,11 +53,11 @@ Same wire protocol as iOS — see [`WIRE.md`](../WIRE.md). **Network is the defa
 
 | Device | Android | Result |
 |---|---|---|
-| Pixel 10 Pro XL | 16 / API 36* | Stream + touch + cursor over Wi‑Fi |
+| Pixel 10 Pro XL | 16 / API 36* | Stream + touch + cursor (Wi‑Fi + USB via `adb forward`) |
 
 \*Installs that report a higher API than `targetSdk` still run; we only require **≥ 26**.
 
-Add your device after testing (PR welcome): model, Android version, Wi‑Fi or `adb reverse`, pass/fail.
+Add your device after testing (PR welcome): model, Android version, Wi‑Fi or `adb forward`, pass/fail.
 
 ## How we keep multi-version working
 
@@ -95,12 +95,12 @@ Needs **JDK 17+** and the Android SDK.
 2. Open this app → choose **USB**.
 3. Plug into the Mac with a data cable; accept the debugging prompt if shown.
 4. Mac OpenDisplay → **Android USB** (needs [platform-tools](https://developer.android.com/tools/releases/platform-tools) `adb` on PATH or in the usual SDK location).
-5. OpenDisplay runs `adb reverse tcp:9000 tcp:9000` and dials `127.0.0.1:9000`.
+5. OpenDisplay runs `adb forward tcp:9000 tcp:9000` and dials `127.0.0.1:9000`.
 
 Manual equivalent:
 
 ```sh
-adb reverse tcp:9000 tcp:9000
+adb forward tcp:9000 tcp:9000
 # Mac → manual connect 127.0.0.1 port 9000
 ```
 
@@ -108,7 +108,7 @@ adb reverse tcp:9000 tcp:9000
 
 Run on each Android version you care about (device or emulator):
 
-- [ ] App launches; idle screen shows port **9000** and a LAN IP (or `adb reverse` path).
+- [ ] App launches; idle screen shows port **9000** and a LAN IP (or `adb forward` path).
 - [ ] `adb logcat -s DeviceReport` shows **H.264 decoder: …** (not MISSING).
 - [ ] Mac connects (discovery **or** manual IP).
 - [ ] Extended display appears; desktop is visible (not black for >3s).
@@ -126,7 +126,7 @@ emulator -avd Pixel_6_API_34 &    # modern
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-Emulator networking to a Mac on the host: use the emulator’s IP as shown in the app, or `adb reverse` from the host Mac.
+Emulator networking to a Mac on the host: use the emulator’s IP as shown in the app, or `adb forward` from the host Mac.
 
 ## Troubleshooting
 

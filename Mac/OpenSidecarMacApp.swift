@@ -95,7 +95,7 @@ enum MainWindow {
 enum ConnectionTarget: Hashable {
     case usb(udid: String?)           // wired via built-in usbmuxd; nil = first device
     case wifi(NWBrowser.Result)       // discovered via Bonjour
-    case androidUsb                   // Android cable via adb reverse → 127.0.0.1
+    case androidUsb                   // Android cable via adb forward → 127.0.0.1
 
     /// Stable identity for sessions and persistence — survives Bonjour
     /// re-discovery (fresh NWBrowser.Result) and USB replugs (new DeviceID).
@@ -276,11 +276,11 @@ final class SenderController: ObservableObject {
                 }.value
                 self.androidUsbAvailable = !serials.isEmpty
                 self.androidUsbLabel = name ?? "Android USB"
-                // Refresh adb reverse for a live Android USB session (replug).
+                // Refresh adb forward for a live Android USB session (replug).
                 if self.session(for: ConnectionTarget.androidUsb.sessionID) != nil,
                    let portNum = UInt16(self.port) {
                     await Task.detached(priority: .utility) {
-                        _ = AndroidAdb.reverse(port: portNum)
+                        _ = AndroidAdb.forward(devicePort: portNum)
                     }.value
                 }
                 try? await Task.sleep(for: .seconds(3))
@@ -555,12 +555,25 @@ final class SenderController: ObservableObject {
             transport = .tcp(result.endpoint)
         case .androidUsb:
             guard let portNum = UInt16(port) else { return }
-            // Reverse phone:9000 → Mac:9000 so we dial loopback.
-            if !AndroidAdb.reverse(port: portNum) {
-                Log.info("Android USB: adb reverse failed — is the phone in USB mode with debugging on?")
+            // Phone listens on devicePort; adb forward maps host loopback →
+            // that port so we can dial 127.0.0.1 (must be forward, not reverse).
+            guard let hostPort = AndroidAdb.forward(devicePort: portNum) else {
+                Log.info("Android USB: adb forward failed — enable USB debugging, accept the RSA prompt, and ensure platform-tools `adb` is installed")
+                // Surface a dismissible row so the click isn't a silent no-op.
+                let name = label(for: target)
+                let failed = MacSender(
+                    transport: .tcp(.hostPort(host: "127.0.0.1",
+                                              port: NWEndpoint.Port(rawValue: portNum)!)),
+                    name: name, mode: mode, quality: quality,
+                    displaySerial: Self.displaySerial(for: id),
+                    awaitingWake: awaitingWake)
+                let session = DeviceSession(id: id, target: target, name: name, sender: failed)
+                session.status = "adb forward failed — USB debugging on? adb installed?"
+                sessions.append(session)
+                return
             }
             transport = .tcp(.hostPort(host: "127.0.0.1",
-                                       port: NWEndpoint.Port(rawValue: portNum)!))
+                                       port: NWEndpoint.Port(rawValue: hostPort)!))
         }
 
         let name = label(for: target)

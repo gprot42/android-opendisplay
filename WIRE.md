@@ -297,7 +297,8 @@ Use **TCP_NODELAY** on both ends (touch packets are tiny).
 | Manual Mac connect | host + port (existing Mac UI / CLI escape hatch) |
 
 Android USB is **not** usbmuxd. Power-user workaround:  
-`adb reverse tcp:9000 tcp:9000` then Mac → `127.0.0.1:9000`.
+`adb forward tcp:9000 tcp:9000` then Mac → `127.0.0.1:9000`  
+(host → device; **not** `adb reverse`, which is the opposite direction and fails while the app is listening on :9000).
 
 ---
 

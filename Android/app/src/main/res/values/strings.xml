@@ -9,7 +9,7 @@
     <string name="service_name_label">Device name</string>
     <string name="mode_network">Network</string>
     <string name="mode_usb">USB</string>
-    <string name="usb_hint">Cable + USB debugging. On the Mac: OpenDisplay → Android USB (runs adb reverse to port 9000).</string>
+    <string name="usb_hint">Cable + USB debugging. On the Mac: OpenDisplay → Android USB (runs adb forward to port 9000).</string>
     <string name="network_hint">Same Wi‑Fi as your Mac. Open OpenDisplay → pick this device, or connect with an address above.</string>
     <string name="fg_channel_name">OpenDisplay</string>
     <string name="fg_channel_desc">Keeps the display session alive in the background</string>
