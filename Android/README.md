@@ -12,6 +12,7 @@ Wi‑Fi only (same wire protocol as iOS — see [`WIRE.md`](../WIRE.md)).
 | TCP listen on port **9000** + `hello` | Works |
 | H.264 hardware decode (MediaCodec) | Works |
 | Touch click / drag + two-finger scroll | Works |
+| Pinch-to-zoom + one-finger pan when zoomed + double-tap reset | Works |
 | Mac cursor overlay (local cursor echo) | Works |
 | mDNS discovery (`_opensidecar._tcp`) | Works when the LAN allows multicast |
 | Manual IP connect (fallback) | Works |
@@ -68,7 +69,8 @@ Add your device after testing (PR welcome): model, Android version, Wi‑Fi or `
 ```sh
 cd Android
 ./gradlew :app:assembleDebug
-adb install -r app/build/outputs/apk/debug/app-debug.apk
+# Version from ../version.md → ~/OpenDisplay-0.0.1-debug.apk
+adb install -r ~/OpenDisplay-*-debug.apk
 ```
 
 Needs **JDK 17+** and the Android SDK.

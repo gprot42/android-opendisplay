@@ -1,9 +1,10 @@
 package app.opendisplay.receiver
 
+import android.graphics.SurfaceTexture
 import android.os.Build
 import android.os.Bundle
-import android.view.SurfaceHolder
-import android.view.SurfaceView
+import android.view.Surface
+import android.view.TextureView
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.FrameLayout
@@ -59,6 +60,8 @@ class MainActivity : ComponentActivity() {
 
     /** Bound when the video view is inflated; cursor updates post to it. */
     @Volatile private var cursorView: CursorOverlayView? = null
+    @Volatile private var videoView: TextureView? = null
+    @Volatile private var videoSurface: Surface? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -104,7 +107,9 @@ class MainActivity : ComponentActivity() {
                 cursorView?.clear()
             },
         )
-        touchMapper = TouchMapper(server)
+        touchMapper = TouchMapper(this, server) { viewport ->
+            applyViewport(viewport)
+        }
         nsd = NsdAdvertiser(this)
 
         val defaultName = Build.MODEL.ifBlank { "OpenDisplay" }
@@ -118,9 +123,21 @@ class MainActivity : ComponentActivity() {
                 val state by uiState.collectAsState()
                 ReceiverScreen(
                     state = state,
-                    onBindCursor = { cursorView = it },
-                    onSurfaceReady = { surface -> decoder.setSurface(surface) },
-                    onSurfaceDestroyed = { decoder.setSurface(null) },
+                    onBindViews = { texture, cursor ->
+                        videoView = texture
+                        cursorView = cursor
+                        applyViewport(touchMapper.viewport())
+                    },
+                    onSurfaceReady = { surface ->
+                        videoSurface?.release()
+                        videoSurface = surface
+                        decoder.setSurface(surface)
+                    },
+                    onSurfaceDestroyed = {
+                        decoder.setSurface(null)
+                        videoSurface?.release()
+                        videoSurface = null
+                    },
                     onTouch = { event, w, h -> touchMapper.onTouch(event, w, h) },
                     onPanelMetrics = { w, h, scale ->
                         server.updatePanel(PanelInfo(w, h, scale))
@@ -137,11 +154,27 @@ class MainActivity : ComponentActivity() {
                         server.announceClosing()
                         nsd.unregister()
                         server.stop()
+                        videoSurface?.release()
+                        videoSurface = null
                     }
                     else -> Unit
                 }
             },
         )
+    }
+
+    private fun applyViewport(viewport: TouchMapper.Viewport) {
+        val video = videoView ?: return
+        val cursor = cursorView
+        // Scale around view center; pan via translation.
+        for (v in listOfNotNull(video, cursor)) {
+            v.pivotX = v.width / 2f
+            v.pivotY = v.height / 2f
+            v.scaleX = viewport.scale
+            v.scaleY = viewport.scale
+            v.translationX = viewport.panX
+            v.translationY = viewport.panY
+        }
     }
 
     private fun updatePanelFromDisplay() {
@@ -167,8 +200,8 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun ReceiverScreen(
     state: ReceiverUiState,
-    onBindCursor: (CursorOverlayView?) -> Unit,
-    onSurfaceReady: (android.view.Surface) -> Unit,
+    onBindViews: (TextureView?, CursorOverlayView?) -> Unit,
+    onSurfaceReady: (Surface) -> Unit,
     onSurfaceDestroyed: () -> Unit,
     onTouch: (android.view.MotionEvent, Int, Int) -> Boolean,
     onPanelMetrics: (widthPx: Int, heightPx: Int, scale: Double) -> Unit,
@@ -193,16 +226,21 @@ private fun ReceiverScreen(
                 )
                 FrameLayout(context).apply {
                     layoutParams = match
-                    val surface = SurfaceView(context).apply {
+                    val texture = TextureView(context).apply {
                         layoutParams = FrameLayout.LayoutParams(match)
-                        holder.addCallback(object : SurfaceHolder.Callback {
-                            override fun surfaceCreated(holder: SurfaceHolder) {
-                                onSurfaceReady(holder.surface)
+                        surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+                            override fun onSurfaceTextureAvailable(
+                                surface: SurfaceTexture,
+                                width: Int,
+                                height: Int,
+                            ) {
+                                onSurfaceReady(Surface(surface))
+                                val density = resources.displayMetrics.density
+                                onPanelMetrics(width, height, density.toDouble())
                             }
 
-                            override fun surfaceChanged(
-                                holder: SurfaceHolder,
-                                format: Int,
+                            override fun onSurfaceTextureSizeChanged(
+                                surface: SurfaceTexture,
                                 width: Int,
                                 height: Int,
                             ) {
@@ -210,22 +248,24 @@ private fun ReceiverScreen(
                                 onPanelMetrics(width, height, density.toDouble())
                             }
 
-                            override fun surfaceDestroyed(holder: SurfaceHolder) {
+                            override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
                                 onSurfaceDestroyed()
+                                // We release the Surface wrapper ourselves.
+                                return true
                             }
-                        })
+
+                            override fun onSurfaceTextureUpdated(surface: SurfaceTexture) = Unit
+                        }
                     }
                     val cursor = CursorOverlayView(context).apply {
                         layoutParams = FrameLayout.LayoutParams(match)
-                        // Don't steal touches — SurfaceView handles input.
                         isClickable = false
                         isFocusable = false
                     }
-                    addView(surface)
+                    addView(texture)
                     addView(cursor)
-                    onBindCursor(cursor)
+                    onBindViews(texture, cursor)
 
-                    // Touch on the container so we still receive events with the overlay on top.
                     setOnTouchListener { v, event ->
                         val handled = onTouch(event, v.width, v.height)
                         if (handled) v.performClick()
@@ -234,7 +274,7 @@ private fun ReceiverScreen(
                 }
             },
             onRelease = {
-                onBindCursor(null)
+                onBindViews(null, null)
             },
         )
 
@@ -260,14 +300,14 @@ private fun IdleOverlay(state: ReceiverUiState) {
             fontSize = 32.sp,
             style = MaterialTheme.typography.headlineMedium,
         )
-        Spacer(Modifier.height(12.dp))
+        Spacer(modifier = Modifier.height(12.dp))
         Text(
             text = state.status,
             color = Color(0xFFB0B0B0),
             fontSize = 18.sp,
             textAlign = TextAlign.Center,
         )
-        Spacer(Modifier.height(24.dp))
+        Spacer(modifier = Modifier.height(24.dp))
         Text(
             text = "Port ${state.port}",
             color = Color.White,
@@ -275,7 +315,7 @@ private fun IdleOverlay(state: ReceiverUiState) {
             fontSize = 16.sp,
         )
         if (state.localAddresses.isNotEmpty()) {
-            Spacer(Modifier.height(8.dp))
+            Spacer(modifier = Modifier.height(8.dp))
             state.localAddresses.forEach { ip ->
                 Text(
                     text = "$ip:${state.port}",
@@ -285,7 +325,7 @@ private fun IdleOverlay(state: ReceiverUiState) {
                 )
             }
         }
-        Spacer(Modifier.height(24.dp))
+        Spacer(modifier = Modifier.height(24.dp))
         Text(
             text = "On your Mac: open OpenDisplay → connect over WiFi,\nor use manual host with an address above.",
             color = Color(0xFF9E9E9E),
@@ -293,14 +333,21 @@ private fun IdleOverlay(state: ReceiverUiState) {
             textAlign = TextAlign.Center,
             lineHeight = 20.sp,
         )
-        Spacer(Modifier.height(12.dp))
+        Spacer(modifier = Modifier.height(12.dp))
+        Text(
+            text = "Pinch to zoom · double-tap to reset · two-finger pan scrolls",
+            color = Color(0xFF6E6E6E),
+            fontSize = 12.sp,
+            textAlign = TextAlign.Center,
+        )
+        Spacer(modifier = Modifier.height(8.dp))
         Text(
             text = "Advertised as \"${state.serviceName}\"",
             color = Color(0xFF6E6E6E),
             fontSize = 12.sp,
         )
         if (state.deviceSummary.isNotEmpty()) {
-            Spacer(Modifier.height(16.dp))
+            Spacer(modifier = Modifier.height(16.dp))
             Text(
                 text = state.deviceSummary,
                 color = Color(0xFF555555),

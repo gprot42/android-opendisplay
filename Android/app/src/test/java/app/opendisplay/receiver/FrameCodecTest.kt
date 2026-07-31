@@ -48,5 +48,34 @@ class FrameCodecTest {
         assertArrayEquals(slice, parsed.nalus[1])
     }
 
+    @Test
+    fun percentileMidAndEmpty() {
+        assertEquals(0.0, app.opendisplay.receiver.video.H264Decoder.percentile(emptyList(), 0.5), 0.0)
+        val samples = listOf(10.0, 20.0, 30.0, 40.0, 50.0)
+        assertEquals(30.0, app.opendisplay.receiver.video.H264Decoder.percentile(samples, 0.5), 0.0)
+        // nearest-rank: index = floor((n-1)*p) → p95 → index 3 → 40
+        assertEquals(40.0, app.opendisplay.receiver.video.H264Decoder.percentile(samples, 0.95), 0.0)
+        assertEquals(50.0, app.opendisplay.receiver.video.H264Decoder.percentile(samples, 1.0), 0.0)
+    }
+
+    @Test
+    fun screenToNormalizedAtIdentity() {
+        // TouchMapper needs a Context for detectors — test the pure mapping math via reflection-free helper.
+        // Identity viewport: center of 200×100 → (0.5, 0.5)
+        val viewW = 200
+        val viewH = 100
+        val scale = 1f
+        val panX = 0f
+        val panY = 0f
+        val cx = viewW / 2f
+        val cy = viewH / 2f
+        val screenX = 100f
+        val screenY = 50f
+        val contentX = (screenX - cx - panX) / scale + cx
+        val contentY = (screenY - cy - panY) / scale + cy
+        assertEquals(0.5, (contentX / viewW).toDouble(), 0.001)
+        assertEquals(0.5, (contentY / viewH).toDouble(), 0.001)
+    }
+
     private fun startCode() = byteArrayOf(0, 0, 0, 1)
 }

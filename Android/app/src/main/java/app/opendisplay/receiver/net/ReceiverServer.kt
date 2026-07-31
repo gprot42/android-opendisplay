@@ -80,8 +80,24 @@ class ReceiverServer(
     private var sessionJob: Job? = null
     private var watchdogJob: Job? = null
     private var pingJob: Job? = null
+    private var statsJob: Job? = null
 
     private var state = ReceiverUiState()
+
+    // Clock sync (lowest-RTT sample, same as iOS PhoneReceiver).
+    private val offsetSamples = ArrayList<Pair<Double, Double>>(16) // rtt → offset
+    @Volatile private var clockOffsetMs: Double? = null
+    @Volatile private var lastRttMs: Double = 0.0
+
+    // Per-window stream health (reset each stats tick).
+    private var windowStartMs = 0L
+    private var framesThisWindow = 0
+    private var bytesThisWindow = 0L
+    private var stallsThisWindow = 0
+    private var lastFrameAtMs = 0L
+    private val e2eWindow = ArrayList<Double>(64)
+    private val encodeWindow = ArrayList<Double>(64)
+    private var statsReportCounter = 0
 
     fun updatePanel(info: PanelInfo) {
         val changed = panel != info
@@ -109,6 +125,7 @@ class ReceiverServer(
         sessionJob?.cancel()
         watchdogJob?.cancel()
         pingJob?.cancel()
+        statsJob?.cancel()
         try {
             clientSocket.getAndSet(null)?.close()
         } catch (_: Exception) {
@@ -217,6 +234,7 @@ class ReceiverServer(
 
     private suspend fun runSession(socket: Socket) = withContext(Dispatchers.IO) {
         lastDataMs.set(System.currentTimeMillis())
+        resetSessionMetrics()
         publish(
             state.copy(
                 status = "Connected — sending hello",
@@ -230,6 +248,7 @@ class ReceiverServer(
             sendHello()
             startPing()
             startWatchdog()
+            startStats()
 
             val input = BufferedInputStream(socket.getInputStream(), 256 * 1024)
             while (scope.isActive && !socket.isClosed) {
@@ -242,6 +261,7 @@ class ReceiverServer(
         } finally {
             pingJob?.cancel()
             watchdogJob?.cancel()
+            statsJob?.cancel()
             try {
                 socket.close()
             } catch (_: Exception) {
@@ -260,14 +280,54 @@ class ReceiverServer(
         }
     }
 
+    private fun resetSessionMetrics() {
+        offsetSamples.clear()
+        clockOffsetMs = null
+        lastRttMs = 0.0
+        windowStartMs = System.currentTimeMillis()
+        framesThisWindow = 0
+        bytesThisWindow = 0L
+        stallsThisWindow = 0
+        lastFrameAtMs = 0L
+        e2eWindow.clear()
+        encodeWindow.clear()
+        statsReportCounter = 0
+    }
+
     private fun handleInbound(payload: ByteArray) {
         if (AnnexBParser.isJsonControl(payload)) {
             handleJson(payload.toString(Charsets.UTF_8))
             return
         }
-        decoder.feed(payload)
+        val parsed = AnnexBParser.parse(payload)
+        noteVideoFrame(payload.size, parsed.captureMs, parsed.sendMs)
+        decoder.feedParsed(parsed)
         if (!state.streaming) {
             publish(state.copy(status = "Streaming", streaming = true))
+        }
+    }
+
+    private fun noteVideoFrame(byteCount: Int, captureMs: Double?, sendMs: Double?) {
+        val now = System.currentTimeMillis()
+        bytesThisWindow += byteCount
+        framesThisWindow++
+        if (lastFrameAtMs > 0) {
+            val gap = now - lastFrameAtMs
+            if (gap > 50) stallsThisWindow++
+        }
+        lastFrameAtMs = now
+
+        if (captureMs != null && sendMs != null) {
+            encodeWindow.add(sendMs - captureMs)
+            if (encodeWindow.size > 120) encodeWindow.removeAt(0)
+            val offset = clockOffsetMs
+            if (offset != null) {
+                val e2e = (now.toDouble() + offset) - captureMs
+                if (e2e > -50 && e2e < 5000) {
+                    e2eWindow.add(e2e)
+                    if (e2eWindow.size > 120) e2eWindow.removeAt(0)
+                }
+            }
         }
     }
 
@@ -275,7 +335,19 @@ class ReceiverServer(
         try {
             val obj = JSONObject(text)
             when (obj.optString("type")) {
-                WireMessage.PONG -> Unit // clock sync later
+                WireMessage.PONG -> {
+                    val t1 = obj.optDouble("t", Double.NaN)
+                    val mt = obj.optDouble("mt", Double.NaN)
+                    if (t1.isNaN() || mt.isNaN()) return
+                    val t2 = System.currentTimeMillis().toDouble()
+                    val rtt = t2 - t1
+                    if (rtt < 0 || rtt >= 2000) return
+                    val offset = mt - (t1 + t2) / 2
+                    offsetSamples.add(rtt to offset)
+                    if (offsetSamples.size > 15) offsetSamples.removeAt(0)
+                    clockOffsetMs = offsetSamples.minByOrNull { it.first }?.second
+                    lastRttMs = rtt
+                }
                 WireMessage.PING -> {
                     // Mac liveness / health — nothing required beyond watchdog.
                 }
@@ -365,6 +437,60 @@ class ReceiverServer(
         }
     }
 
+    /** Every 1s roll a local window; every 5s send aggregate `stats` to the Mac. */
+    private fun startStats() {
+        statsJob?.cancel()
+        statsJob = scope.launch {
+            while (isActive) {
+                delay(1_000)
+                val now = System.currentTimeMillis()
+                val elapsed = (now - windowStartMs).coerceAtLeast(1) / 1000.0
+                val fps = (framesThisWindow / elapsed).toInt()
+                val mbps = bytesThisWindow * 8.0 / elapsed / 1_000_000.0
+                val stalls = stallsThisWindow
+                val e2e50 = H264Decoder.percentile(e2eWindow, 0.5)
+                val e2e95 = H264Decoder.percentile(e2eWindow, 0.95)
+                val enc50 = H264Decoder.percentile(encodeWindow, 0.5)
+                val decSnap = decoder.snapshotAndResetDecodeSamples()
+
+                framesThisWindow = 0
+                bytesThisWindow = 0L
+                stallsThisWindow = 0
+                windowStartMs = now
+
+                statsReportCounter++
+                if (statsReportCounter < 5) continue
+                statsReportCounter = 0
+
+                val json = JSONObject()
+                    .put("type", WireMessage.STATS)
+                    .put("transport", "WiFi")
+                    .put("fps", fps)
+                    .put("mbps", (mbps * 10).toLong() / 10.0)
+                    .put("e2e50", e2e50.roundTo())
+                    .put("e2e95", e2e95.roundTo())
+                    .put("enc50", enc50.roundTo())
+                    .put("rtt", lastRttMs.roundTo())
+                    .put("stalls", stalls)
+                    .put("dec50", decSnap.decodeP50Ms.roundTo())
+                    .put("drops", decSnap.inputDrops + decSnap.outputDrops)
+                    .put("inDrops", decSnap.inputDrops)
+                    .put("outDrops", decSnap.outputDrops)
+                    .put("offsetKnown", clockOffsetMs != null)
+                sendJson(json)
+                Log.i(
+                    tag,
+                    "stats fps=$fps mbps=${"%.1f".format(mbps)} e2e50=${e2e50.toInt()} " +
+                        "rtt=${lastRttMs.toInt()} drops=${decSnap.inputDrops + decSnap.outputDrops}",
+                )
+                e2eWindow.clear()
+                encodeWindow.clear()
+            }
+        }
+    }
+
+    private fun Double.roundTo(): Double = kotlin.math.round(this)
+
     private fun closeClient(reason: String) {
         Log.i(tag, "close client ($reason)")
         try {
@@ -374,6 +500,7 @@ class ReceiverServer(
         sessionJob?.cancel()
         pingJob?.cancel()
         watchdogJob?.cancel()
+        statsJob?.cancel()
     }
 
     fun onVideoSize(width: Int, height: Int) {

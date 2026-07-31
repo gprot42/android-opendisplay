@@ -7,14 +7,19 @@ import android.util.Log
 import android.view.Surface
 import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Hardware H.264 decode into a Surface. Configures from in-band SPS/PPS.
  *
+ * Latency policy:
+ * - Never block waiting for an input buffer (timeout 0) — drop the frame instead.
+ * - When several output buffers are ready, render only the newest (drop older).
+ * - After input drops, request a keyframe so the stream can recover.
+ *
  * Cross-version notes (minSdk 26):
  * - [MediaFormat.KEY_LOW_LATENCY] is API 30+ only; below that we try vendor keys.
  * - [MediaFormat.KEY_PRIORITY] is API 23+ (always available here).
- * - Decoder name / behavior varies by OEM; configure failures request a keyframe.
  */
 class H264Decoder(
     private val onNeedKeyframe: () -> Unit,
@@ -29,6 +34,37 @@ class H264Decoder(
     private val released = AtomicBoolean(false)
     private var ptsUs = 0L
     private var configureAttempts = 0
+    private var consecutiveInputDrops = 0
+
+    private val framesIn = AtomicLong(0)
+    private val framesOut = AtomicLong(0)
+    private val inputDrops = AtomicLong(0)
+    private val outputDrops = AtomicLong(0)
+    private val decodeMsSamples = ArrayList<Double>(64)
+    private val sampleLock = Any()
+
+    data class Snapshot(
+        val framesIn: Long,
+        val framesOut: Long,
+        val inputDrops: Long,
+        val outputDrops: Long,
+        val decodeP50Ms: Double,
+    )
+
+    fun snapshotAndResetDecodeSamples(): Snapshot {
+        val p50 = synchronized(sampleLock) {
+            val v = percentile(decodeMsSamples, 0.5)
+            decodeMsSamples.clear()
+            v
+        }
+        return Snapshot(
+            framesIn = framesIn.get(),
+            framesOut = framesOut.get(),
+            inputDrops = inputDrops.get(),
+            outputDrops = outputDrops.get(),
+            decodeP50Ms = p50,
+        )
+    }
 
     fun setSurface(surface: Surface?) {
         this.surface = surface
@@ -42,13 +78,19 @@ class H264Decoder(
     fun feed(payload: ByteArray) {
         if (released.get()) return
         if (AnnexBParser.isJsonControl(payload)) return
+        feedParsed(AnnexBParser.parse(payload))
+    }
 
-        val parsed = AnnexBParser.parse(payload)
+    fun feedParsed(parsed: AnnexBParser.ParsedFrame) {
+        if (released.get()) return
+
+        val feedStartNs = System.nanoTime()
         var formatChanged = false
         val vcl = ArrayList<ByteArray>()
+        var hasIdr = false
 
         for (nalu in parsed.nalus) {
-            when (AnnexBParser.naluType(nalu)) {
+            when (val t = AnnexBParser.naluType(nalu)) {
                 7 -> { // SPS
                     if (sps == null || !sps.contentEquals(nalu)) {
                         sps = nalu
@@ -62,6 +104,10 @@ class H264Decoder(
                     }
                 }
                 6 -> Unit // SEI
+                5 -> {
+                    hasIdr = true
+                    vcl.add(nalu)
+                }
                 else -> vcl.add(nalu)
             }
         }
@@ -83,8 +129,18 @@ class H264Decoder(
         if (!configured || vcl.isEmpty()) return
 
         val annexB = toAnnexB(vcl)
-        queueInput(annexB)
+        if (!queueInput(annexB, isIdr = hasIdr)) {
+            return
+        }
+        framesIn.incrementAndGet()
         drainOutput()
+        val decodeMs = (System.nanoTime() - feedStartNs) / 1_000_000.0
+        synchronized(sampleLock) {
+            decodeMsSamples.add(decodeMs)
+            if (decodeMsSamples.size > 120) {
+                decodeMsSamples.removeAt(0)
+            }
+        }
     }
 
     private fun configure(sps: ByteArray, pps: ByteArray) {
@@ -114,12 +170,14 @@ class H264Decoder(
             c2.start()
             codec = c2
             configured = true
+            consecutiveInputDrops = 0
             Log.i(tag, "decoder configured (plain) ${width}x${height} name=${c2.name}")
             return
         }
         c.start()
         codec = c
         configured = true
+        consecutiveInputDrops = 0
         Log.i(tag, "decoder configured ${width}x${height} name=${c.name} attempt=$configureAttempts")
     }
 
@@ -158,36 +216,52 @@ class H264Decoder(
         }
     }
 
-    private fun queueInput(annexB: ByteArray) {
-        val c = codec ?: return
+    /** @return true if the frame was queued */
+    private fun queueInput(annexB: ByteArray, isIdr: Boolean): Boolean {
+        val c = codec ?: return false
         try {
-            val inIndex = c.dequeueInputBuffer(2_000)
+            // Non-blocking: never stall the TCP read loop waiting on the codec.
+            val inIndex = c.dequeueInputBuffer(0)
             if (inIndex < 0) {
-                Log.w(tag, "no input buffer — requesting keyframe")
-                onNeedKeyframe()
-                return
+                inputDrops.incrementAndGet()
+                consecutiveInputDrops++
+                // After a few drops, demand an IDR so we can resync cleanly.
+                if (consecutiveInputDrops >= 2 || isIdr) {
+                    onNeedKeyframe()
+                }
+                if (consecutiveInputDrops == 1 || consecutiveInputDrops % 30 == 0) {
+                    Log.w(tag, "no input buffer — drop frame (drops=${inputDrops.get()})")
+                }
+                return false
             }
-            val buf = c.getInputBuffer(inIndex) ?: return
+            consecutiveInputDrops = 0
+            val buf = c.getInputBuffer(inIndex) ?: return false
             buf.clear()
             if (buf.remaining() < annexB.size) {
                 Log.w(tag, "input buffer too small ${buf.remaining()} < ${annexB.size}")
+                c.queueInputBuffer(inIndex, 0, 0, ptsUs, 0)
+                inputDrops.incrementAndGet()
                 onNeedKeyframe()
-                return
+                return false
             }
             buf.put(annexB)
             ptsUs += 16_666
             c.queueInputBuffer(inIndex, 0, annexB.size, ptsUs, 0)
+            return true
         } catch (e: Exception) {
             Log.e(tag, "queueInput failed", e)
             releaseCodecOnly()
             configured = false
             onNeedKeyframe()
+            return false
         }
     }
 
     private fun drainOutput() {
         val c = codec ?: return
         val info = MediaCodec.BufferInfo()
+        // Collect all ready buffers; render only the last for lower latency.
+        val pending = ArrayList<Int>(4)
         try {
             while (true) {
                 val outIndex = c.dequeueOutputBuffer(info, 0)
@@ -200,13 +274,24 @@ class H264Decoder(
                         Log.i(tag, "output format $w x $h")
                         onVideoSize(w, h)
                     }
-                    outIndex >= 0 -> {
-                        c.releaseOutputBuffer(outIndex, true)
-                    }
+                    outIndex >= 0 -> pending.add(outIndex)
                 }
             }
+            if (pending.isEmpty()) return
+            for (i in 0 until pending.lastIndex) {
+                c.releaseOutputBuffer(pending[i], false)
+                outputDrops.incrementAndGet()
+            }
+            c.releaseOutputBuffer(pending.last(), true)
+            framesOut.incrementAndGet()
         } catch (e: Exception) {
             Log.e(tag, "drainOutput failed", e)
+            for (idx in pending) {
+                try {
+                    c.releaseOutputBuffer(idx, false)
+                } catch (_: Exception) {
+                }
+            }
             releaseCodecOnly()
             configured = false
             onNeedKeyframe()
@@ -268,5 +353,14 @@ class H264Decoder(
         // Many SPS blobs encode 1080p-class streams; decoder will correct via
         // INFO_OUTPUT_FORMAT_CHANGED. Avoid wrong non-zero that breaks some OEMs.
         return null
+    }
+
+    companion object {
+        fun percentile(samples: List<Double>, p: Double): Double {
+            if (samples.isEmpty()) return 0.0
+            val sorted = samples.sorted()
+            val idx = ((sorted.size - 1) * p).toInt().coerceIn(0, sorted.lastIndex)
+            return sorted[idx]
+        }
     }
 }
