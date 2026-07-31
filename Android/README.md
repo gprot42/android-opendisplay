@@ -41,8 +41,11 @@ Same wire protocol as iOS — see [`WIRE.md`](../WIRE.md). **Network is the defa
 | 8–9 | 26–28 | Vendor low-latency keys only | NSD | Expect higher latency; use Mac quality **Fast** on Wi‑Fi |
 | 10 | 29 | Vendor keys | NSD | Same as above |
 | **11+** | **30+** | `KEY_LOW_LATENCY` + vendors | NSD | Best path |
-| 12+ | 31+ | Same | NSD | Some OEMs isolate “guest” Wi‑Fi — use manual IP if Mac can’t see the device |
-| 13+ | 33+ | Same | NSD | Declares `NEARBY_WIFI_DEVICES` (never for location) |
+| 12 | 31–32 | Same | NSD | Some OEMs isolate “guest” Wi‑Fi — use manual IP if Mac can’t see the device |
+| 13 | 33 | Same | NSD | Declares `NEARBY_WIFI_DEVICES` (never for location) |
+| 14 | 34 | Same | NSD | Same low-latency path as 11+ |
+| 15 | 35 | Same | NSD | **targetSdk**; same as 11+ |
+| 16 | 36 | Same | NSD | Runs above targetSdk; verified on Pixel 10 Pro XL |
 
 **Required on the device:** a hardware **H.264 / AVC** decoder (every normal phone/tablet has one). Soft decoders are not targeted.
 

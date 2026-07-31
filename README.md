@@ -53,8 +53,11 @@ Free, open source, no subscription — alternative to Sidecar / Duet / Luna on h
 | **8.0–9** | **26–28** | Supported | Higher latency; Mac quality **Fast** |
 | **10** | **29** | Supported | Same as above |
 | **11+** | **30+** | **Recommended** | Official low-latency decode |
-| **12+** | **31+** | Supported | Guest Wi‑Fi may block mDNS → use manual IP |
-| **13+** | **33+** | Supported | `NEARBY_WIFI_DEVICES` for discovery |
+| **12** | **31–32** | Supported | Guest Wi‑Fi may block mDNS → use manual IP |
+| **13** | **33** | Supported | `NEARBY_WIFI_DEVICES` for discovery |
+| **14** | **34** | Supported | Same as 11+ (low-latency path) |
+| **15** | **35** | Supported | **targetSdk**; same as 11+ |
+| **16** | **36** | Supported | Runs above targetSdk; verified on Pixel 10 Pro XL |
 
 | | |
 |---|---|
