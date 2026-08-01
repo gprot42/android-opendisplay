@@ -49,8 +49,8 @@ enum DisplayArrangement {
     }
 
     /// Origin for a new virtual display of `size` points, on the preferred
-    /// side of the main display (tops aligned). WindowServer may snap the
-    /// final position to a valid adjacent arrangement.
+    /// side of the main display (vertically centered). WindowServer may snap
+    /// the final position to a valid adjacent arrangement.
     static func origin(for size: CGSize, device: String) -> CGPoint? {
         // Prefer the explicit Left/Right setting so orientation / transport
         // identity churn doesn’t shuffle the phone to a random corner.
@@ -61,10 +61,12 @@ enum DisplayArrangement {
     }
 
     /// Point-origin so the virtual display sits flush against the main
-    /// screen on `side`, top edges aligned.
+    /// screen on `side`. Vertically center against the main display so the
+    /// shared edge is as long as possible — tops-only alignment leaves a
+    /// dead zone at the bottom of a tall Mac where drag-to-edge fails.
     static func sideOrigin(_ side: DisplaySide, size: CGSize) -> CGPoint {
         let main = CGDisplayBounds(CGMainDisplayID())
-        let y = main.minY
+        let y = main.minY + max(0, (main.height - size.height) / 2)
         switch side {
         case .right:
             return CGPoint(x: main.maxX, y: y)

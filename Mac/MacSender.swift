@@ -348,10 +348,11 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // = native pixels / 2 (rounded down to even for the encoder).
         let pointsWide = (info.pixelsWide / 2) & ~1
         let pointsHigh = (info.pixelsHigh / 2) & ~1
-        // Rough physical size so macOS picks a sane default UI scale.
-        let mm = info.pixelsWide >= info.pixelsHigh
-            ? CGSize(width: 147, height: 68)
-            : CGSize(width: 68, height: 147)
+        // Physical size drives macOS's PPI / "is this a TV?" heuristics.
+        // Hard-coded phone mm made tablets look like tiny ultra-dense panels
+        // and could confuse arrangement / window placement.
+        let mm = Self.physicalSizeMillimeters(pixelsWide: info.pixelsWide,
+                                              pixelsHigh: info.pixelsHigh)
 
         // USB sessions can start before lockdown resolves the device name —
         // fall back to the kind from the hello rather than the generic label.
@@ -720,6 +721,81 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
+    /// True when extend mode has a live virtual display that can host windows.
+    var canHostWindows: Bool {
+        mode == .extend && virtualDisplay != nil
+    }
+
+    /// Move the frontmost app's focused window onto this session's virtual
+    /// display. Useful when drag-to-edge is finicky (separate Spaces, Stage
+    /// Manager, short shared edges). Requires Accessibility.
+    @discardableResult
+    @MainActor
+    func moveFrontWindowToDisplay() -> Bool {
+        guard mode == .extend, let vd = virtualDisplay else {
+            Log.info("moveFrontWindow: no virtual display")
+            return false
+        }
+        guard AXIsProcessTrusted() else {
+            _ = InputInjector.ensureAccessibilityPermission()
+            Log.info("moveFrontWindow: Accessibility required")
+            Task { await status("Grant Accessibility, then use Send Window again") }
+            return false
+        }
+        let bounds = CGDisplayBounds(vd.displayID)
+        guard bounds.width > 1, bounds.height > 1 else { return false }
+
+        guard let app = NSWorkspace.shared.frontmostApplication else {
+            Log.info("moveFrontWindow: no frontmost app")
+            return false
+        }
+        // Don't steal OpenDisplay's own window.
+        if app.processIdentifier == ProcessInfo.processInfo.processIdentifier {
+            Log.info("moveFrontWindow: frontmost is OpenDisplay — focus another app first")
+            Task { await status("Click the app window you want, then Send Window") }
+            return false
+        }
+
+        let axApp = AXUIElementCreateApplication(app.processIdentifier)
+        var windowRef: CFTypeRef?
+        let focusedErr = AXUIElementCopyAttributeValue(
+            axApp, kAXFocusedWindowAttribute as CFString, &windowRef)
+        if focusedErr != .success
+            || windowRef == nil
+            || CFGetTypeID(windowRef!) != AXUIElementGetTypeID() {
+            // Fall back to main window.
+            var mainRef: CFTypeRef?
+            let mainErr = AXUIElementCopyAttributeValue(
+                axApp, kAXMainWindowAttribute as CFString, &mainRef)
+            guard mainErr == .success,
+                  let mainRef,
+                  CFGetTypeID(mainRef) == AXUIElementGetTypeID() else {
+                Log.info("moveFrontWindow: no focused/main window for \(app.localizedName ?? "?")")
+                return false
+            }
+            windowRef = mainRef
+        }
+        let window = windowRef as! AXUIElement
+
+        // Leave a margin so the title bar stays draggable; size to ~90% of the
+        // panel so the user immediately sees the app on the tablet.
+        let margin: CGFloat = 24
+        var pos = CGPoint(x: bounds.minX + margin, y: bounds.minY + margin)
+        var size = CGSize(
+            width: max(320, bounds.width - margin * 2),
+            height: max(240, bounds.height - margin * 2)
+        )
+        guard let posVal = AXValueCreate(.cgPoint, &pos),
+              let sizeVal = AXValueCreate(.cgSize, &size) else { return false }
+
+        AXUIElementSetAttributeValue(window, kAXPositionAttribute as CFString, posVal)
+        AXUIElementSetAttributeValue(window, kAXSizeAttribute as CFString, sizeVal)
+        Log.info("moveFrontWindow: \(app.localizedName ?? "app") → display \(vd.displayID) "
+            + "(\(Int(bounds.minX)),\(Int(bounds.minY)) \(Int(size.width))x\(Int(size.height)))")
+        Task { await status("Moved \(app.localizedName ?? "window") to the device") }
+        return true
+    }
+
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         Log.info("stream stopped with error: \(error)")
         Task { await status("Capture stopped: \(error.localizedDescription)") }
@@ -797,6 +873,20 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         let h = pxH > 0 ? pxH : display.height
         return ((Int(Double(w) * qualityScale) & ~1),
                 (Int(Double(h) * qualityScale) & ~1))
+    }
+
+    /// Estimate panel size in millimeters from native pixels.
+    /// Long-edge ≥ 2000 → tablet-class (~11"); otherwise phone-class (~6.1").
+    private static func physicalSizeMillimeters(pixelsWide: Int, pixelsHigh: Int) -> CGSize {
+        let longEdge = max(pixelsWide, pixelsHigh)
+        let diagonalInches: Double = longEdge >= 2000 ? 11.0 : 6.1
+        let diagPx = hypot(Double(pixelsWide), Double(pixelsHigh))
+        guard diagPx > 0 else {
+            return CGSize(width: 147, height: 68)
+        }
+        let mmPerPx = (diagonalInches * 25.4) / diagPx
+        return CGSize(width: Double(pixelsWide) * mmPerPx,
+                      height: Double(pixelsHigh) * mmPerPx)
     }
 
     private func connectTCP(_ endpoint: NWEndpoint) {

@@ -988,7 +988,7 @@ struct ContentView: View {
                         }
                         .pickerStyle(.segmented)
                         .onChange(of: controller.displaySide) { controller.restartAll() }
-                        Text("Places the device \(controller.displaySide == .left ? "to the left" : "to the right") of your Mac display when connecting. Fine-tune anytime in System Settings → Displays.")
+                        Text("Places the device \(controller.displaySide == .left ? "to the left" : "to the right") of your Mac when connecting. Drag a window past that edge of the Mac screen, or use Send Window on the session. Fine-tune in System Settings → Displays.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -1187,6 +1187,17 @@ struct SessionRow: View {
             }
 
             HStack(spacing: 8) {
+                if session.sender.canHostWindows {
+                    Button {
+                        // Focus another app first; this moves that app's front window.
+                        _ = session.sender.moveFrontWindowToDisplay()
+                    } label: {
+                        Label("Send Window", systemImage: "rectangle.portrait.and.arrow.right")
+                    }
+                    .controlSize(.small)
+                    .help("Move the frontmost app’s window onto this device. Click the app first (not OpenDisplay), then press Send Window. Needs Accessibility permission.")
+                }
+
                 Button {
                     session.sender.forceReconnect()
                 } label: {
