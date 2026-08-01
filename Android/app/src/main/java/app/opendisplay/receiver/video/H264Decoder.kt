@@ -68,12 +68,27 @@ class H264Decoder(
     }
 
     fun setSurface(surface: Surface?) {
+        if (this.surface === surface && surface != null) return
         this.surface = surface
         // Surface changed — force reconfigure with next SPS/PPS.
         if (configured) {
             releaseCodecOnly()
             configured = false
         }
+    }
+
+    /**
+     * Tear down the codec between Mac sessions without dropping the UI
+     * Surface. Clearing the surface (old behaviour) left reconnects unable
+     * to configure: frames arrived but [configure] returned early → black
+     * tablet until the TextureView was recreated.
+     */
+    fun resetForNewSession() {
+        releaseCodecOnly()
+        configured = false
+        sps = null
+        pps = null
+        consecutiveInputDrops = 0
     }
 
     fun feed(payload: ByteArray) {
@@ -146,7 +161,12 @@ class H264Decoder(
 
     private fun configure(sps: ByteArray, pps: ByteArray) {
         releaseCodecOnly()
-        val surf = surface ?: return
+        val surf = surface
+        if (surf == null || !surf.isValid) {
+            Log.w(tag, "configure skipped — no valid Surface yet (will retry on next keyframe)")
+            requestKeyframeThrottled()
+            return
+        }
         configureAttempts++
 
         val (width, height) = estimateSizeFromSps(sps) ?: (1920 to 1080)
@@ -367,9 +387,19 @@ class H264Decoder(
     }
 
     companion object {
-        fun percentile(samples: List<Double>, p: Double): Double {
+        /**
+         * p in [0,1]. Tolerates empty lists and nulls (concurrent snapshot races).
+         */
+        fun percentile(samples: List<Double?>, p: Double): Double {
             if (samples.isEmpty()) return 0.0
-            val sorted = samples.sorted()
+            // Copy + drop nulls: ArrayList can expose nulls if mutated while
+            // toTypedArray/sorted runs on another thread.
+            val sorted = ArrayList<Double>(samples.size)
+            for (v in samples) {
+                if (v != null && !v.isNaN()) sorted.add(v)
+            }
+            if (sorted.isEmpty()) return 0.0
+            sorted.sort()
             val idx = ((sorted.size - 1) * p).toInt().coerceIn(0, sorted.lastIndex)
             return sorted[idx]
         }

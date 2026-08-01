@@ -3,6 +3,7 @@ package app.opendisplay.receiver.net
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import app.opendisplay.receiver.audio.AudioPlayer
 import app.opendisplay.receiver.protocol.WireMessage
 import app.opendisplay.receiver.protocol.WireProtocol
 import app.opendisplay.receiver.video.AnnexBParser
@@ -33,6 +34,16 @@ data class PanelInfo(
     val pixelsWide: Int,
     val pixelsHigh: Int,
     val scale: Double,
+)
+
+/** One-second metrics snapshot for the stats loop (thread-safe handoff). */
+private data class StatsTick(
+    val fps: Int,
+    val mbps: Double,
+    val stalls: Int,
+    val e2e50: Double,
+    val e2e95: Double,
+    val enc50: Double,
 )
 
 data class ReceiverUiState(
@@ -71,6 +82,7 @@ class ReceiverServer(
     private val writeMutex = Mutex()
     private val lastDataMs = AtomicLong(0)
     private val clientSocket = AtomicReference<Socket?>(null)
+    private val audioPlayer = AudioPlayer()
 
     @Volatile private var serverSocket: ServerSocket? = null
     @Volatile private var panel = PanelInfo(1920, 1200, 2.0)
@@ -98,6 +110,8 @@ class ReceiverServer(
     private var bytesThisWindow = 0L
     private var stallsThisWindow = 0
     private var lastFrameAtMs = 0L
+    // Session read thread + stats coroutine both touch these — guard access.
+    private val metricsLock = Any()
     private val e2eWindow = ArrayList<Double>(64)
     private val encodeWindow = ArrayList<Double>(64)
     private var statsReportCounter = 0
@@ -145,6 +159,7 @@ class ReceiverServer(
         }
         serverSocket = null
         decoder.release()
+        audioPlayer.release()
         scope.cancel()
         publish(
             state.copy(
@@ -318,6 +333,14 @@ class ReceiverServer(
             }
             if (clientSocket.get() === socket) clientSocket.set(null)
             mainHandler.post { onCursorReset() }
+            // Keep the TextureView Surface bound — only tear down the codec.
+            // setSurface(null) made reconnects stay black: SPS arrived with no
+            // surface, configure returned early, UI never showed video.
+            try {
+                decoder.resetForNewSession()
+            } catch (_: Exception) {
+            }
+            audioPlayer.stop()
             publish(
                 state.copy(
                     status = "Waiting for Mac…",
@@ -335,18 +358,25 @@ class ReceiverServer(
         clockOffsetMs = null
         lastRttMs = 0.0
         windowStartMs = System.currentTimeMillis()
-        framesThisWindow = 0
-        bytesThisWindow = 0L
-        stallsThisWindow = 0
-        lastFrameAtMs = 0L
-        e2eWindow.clear()
-        encodeWindow.clear()
+        synchronized(metricsLock) {
+            framesThisWindow = 0
+            bytesThisWindow = 0L
+            stallsThisWindow = 0
+            lastFrameAtMs = 0L
+            e2eWindow.clear()
+            encodeWindow.clear()
+        }
         statsReportCounter = 0
     }
 
     private fun handleInbound(payload: ByteArray) {
         if (AnnexBParser.isJsonControl(payload)) {
             handleJson(payload.toString(Charsets.UTF_8))
+            return
+        }
+        // System audio from Mac (AUD1 PCM) — not video.
+        if (AudioPlayer.isAudioFrame(payload)) {
+            audioPlayer.feed(payload)
             return
         }
         val parsed = AnnexBParser.parse(payload)
@@ -359,23 +389,25 @@ class ReceiverServer(
 
     private fun noteVideoFrame(byteCount: Int, captureMs: Double?, sendMs: Double?) {
         val now = System.currentTimeMillis()
-        bytesThisWindow += byteCount
-        framesThisWindow++
-        if (lastFrameAtMs > 0) {
-            val gap = now - lastFrameAtMs
-            if (gap > 50) stallsThisWindow++
-        }
-        lastFrameAtMs = now
+        val offset = clockOffsetMs
+        synchronized(metricsLock) {
+            bytesThisWindow += byteCount
+            framesThisWindow++
+            if (lastFrameAtMs > 0) {
+                val gap = now - lastFrameAtMs
+                if (gap > 50) stallsThisWindow++
+            }
+            lastFrameAtMs = now
 
-        if (captureMs != null && sendMs != null) {
-            encodeWindow.add(sendMs - captureMs)
-            if (encodeWindow.size > 120) encodeWindow.removeAt(0)
-            val offset = clockOffsetMs
-            if (offset != null) {
-                val e2e = (now.toDouble() + offset) - captureMs
-                if (e2e > -50 && e2e < 5000) {
-                    e2eWindow.add(e2e)
-                    if (e2eWindow.size > 120) e2eWindow.removeAt(0)
+            if (captureMs != null && sendMs != null) {
+                encodeWindow.add(sendMs - captureMs)
+                if (encodeWindow.size > 120) encodeWindow.removeAt(0)
+                if (offset != null) {
+                    val e2e = (now.toDouble() + offset) - captureMs
+                    if (e2e > -50 && e2e < 5000) {
+                        e2eWindow.add(e2e)
+                        if (e2eWindow.size > 120) e2eWindow.removeAt(0)
+                    }
                 }
             }
         }
@@ -442,8 +474,10 @@ class ReceiverServer(
             .put("device", "Android")
             .put("id", installId)
             .put("pv", WireProtocol.VERSION)
+            // Ask the Mac to stream system audio (AUD1 frames).
+            .put("audio", 1)
         sendJson(json)
-        Log.i(tag, "hello ${p.pixelsWide}x${p.pixelsHigh} @${p.scale}x")
+        Log.i(tag, "hello ${p.pixelsWide}x${p.pixelsHigh} @${p.scale}x audio=1")
     }
 
     private suspend fun sendJson(obj: JSONObject) {
@@ -476,15 +510,16 @@ class ReceiverServer(
         watchdogJob?.cancel()
         watchdogJob = scope.launch {
             // Longer first grace: Mac may still be building the virtual display
-            // / waiting for Screen Recording after TCP connects (often 5–15s).
+            // / waiting for Screen Recording after TCP connects (often 5–20s).
             val connectedAt = System.currentTimeMillis()
             while (isActive) {
                 delay(1_000)
                 val idle = System.currentTimeMillis() - lastDataMs.get()
                 val sinceConnect = System.currentTimeMillis() - connectedAt
-                // First 12s: allow longer silence (setup / permission). After
-                // that, 6s of total radio silence means a half-open link.
-                val limit = if (sinceConnect < 12_000) 12_000L else 6_000L
+                // First 20s: setup / permission / first keyframe. After that,
+                // 15s of total radio silence means a half-open link. Shorter
+                // limits (6s) dropped healthy sessions under decoder load.
+                val limit = if (sinceConnect < 20_000) 20_000L else 15_000L
                 if (idle > limit) {
                     Log.w(tag, "watchdog: no data for ${idle}ms — dropping")
                     closeClient("watchdog")
@@ -501,19 +536,28 @@ class ReceiverServer(
             while (isActive) {
                 delay(1_000)
                 val now = System.currentTimeMillis()
-                val elapsed = (now - windowStartMs).coerceAtLeast(1) / 1000.0
-                val fps = (framesThisWindow / elapsed).toInt()
-                val mbps = bytesThisWindow * 8.0 / elapsed / 1_000_000.0
-                val stalls = stallsThisWindow
-                val e2e50 = H264Decoder.percentile(e2eWindow, 0.5)
-                val e2e95 = H264Decoder.percentile(e2eWindow, 0.95)
-                val enc50 = H264Decoder.percentile(encodeWindow, 0.5)
+                val (fps, mbps, stalls, e2e50, e2e95, enc50) = synchronized(metricsLock) {
+                    val elapsed = (now - windowStartMs).coerceAtLeast(1) / 1000.0
+                    val f = (framesThisWindow / elapsed).toInt()
+                    val m = bytesThisWindow * 8.0 / elapsed / 1_000_000.0
+                    val s = stallsThisWindow
+                    // Snapshot before percentile so session thread can keep writing.
+                    val e2eSnap = ArrayList(e2eWindow)
+                    val encSnap = ArrayList(encodeWindow)
+                    framesThisWindow = 0
+                    bytesThisWindow = 0L
+                    stallsThisWindow = 0
+                    windowStartMs = now
+                    StatsTick(
+                        fps = f,
+                        mbps = m,
+                        stalls = s,
+                        e2e50 = H264Decoder.percentile(e2eSnap, 0.5),
+                        e2e95 = H264Decoder.percentile(e2eSnap, 0.95),
+                        enc50 = H264Decoder.percentile(encSnap, 0.5),
+                    )
+                }
                 val decSnap = decoder.snapshotAndResetDecodeSamples()
-
-                framesThisWindow = 0
-                bytesThisWindow = 0L
-                stallsThisWindow = 0
-                windowStartMs = now
 
                 statsReportCounter++
                 if (statsReportCounter < 5) continue

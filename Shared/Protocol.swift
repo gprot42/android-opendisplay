@@ -11,7 +11,9 @@ import Foundation
 /// protocol 1 — that's every install in the field that predates the handshake.
 enum WireProtocol {
     /// The protocol version this build speaks.
-    static let version = 2
+    /// 3 = optional system-audio frames (`AUD1` PCM) when the receiver
+    /// advertises `"audio":1` on hello.
+    static let version = 3
 
     /// Oldest peer protocol version this build still supports. Stays at 1
     /// (support everything) until a deliberate two-phase breaking change

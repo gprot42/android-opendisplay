@@ -33,6 +33,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
@@ -112,6 +113,13 @@ class MainActivity : ComponentActivity() {
                     deviceSummary = next.deviceSummary.ifEmpty { deviceInfo.summaryLine() },
                     connectionMode = connectionMode.name,
                 )
+                // Re-bind the live TextureView after a reconnect so the decoder
+                // has a Surface even if a prior session cleared codec state.
+                if (next.connected) {
+                    videoSurface?.let { surface ->
+                        if (surface.isValid) decoder.setSurface(surface)
+                    }
+                }
             },
             decoder = decoder,
             onCursor = { x, y, visible ->
@@ -339,8 +347,15 @@ private fun ReceiverScreen(
             .fillMaxSize()
             .background(Color.Black),
     ) {
+        // Keep the surface alive while idle so reconnect does not drop the
+        // first keyframe. Alpha 0 + solid IdleOverlay hide any leftover frame
+        // when the Mac stops sharing.
         AndroidView(
-            modifier = Modifier.fillMaxSize(),
+            modifier = Modifier
+                .fillMaxSize()
+                .then(
+                    if (state.streaming) Modifier else Modifier.alpha(0f),
+                ),
             factory = { context ->
                 val match = ViewGroup.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
@@ -416,7 +431,8 @@ private fun IdleOverlay(
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .background(Color(0xCC000000))
+            // Fully opaque: never show a leftover stream frame behind the menu.
+            .background(Color.Black)
             .padding(32.dp),
         verticalArrangement = Arrangement.Center,
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -468,17 +484,24 @@ private fun IdleOverlay(
             ConnectionMode.USB -> {
                 Spacer(modifier = Modifier.height(12.dp))
                 Text(
-                    text = "127.0.0.1:${state.port}",
-                    color = Color(0xFF8AB4F8),
-                    fontFamily = FontFamily.Monospace,
-                    fontSize = 18.sp,
+                    text = "Best for Mac Wi‑Fi: USB debugging + adb",
+                    color = Color(0xFF81C995),
+                    fontSize = 15.sp,
+                    textAlign = TextAlign.Center,
                 )
-                Spacer(modifier = Modifier.height(16.dp))
+                Spacer(modifier = Modifier.height(12.dp))
                 Text(
-                    text = "1. Enable USB debugging on this phone\n" +
-                        "2. Plug into the Mac with a data cable\n" +
+                    text = "Recommended (keeps Mac internet):\n" +
+                        "1. Enable USB debugging\n" +
+                        "2. Plug into the Mac · accept prompt\n" +
                         "3. Mac OpenDisplay → Android USB\n" +
-                        "   (runs adb forward to port ${state.port})",
+                        "   (do not turn on USB tethering)\n\n" +
+                        "Without debugging (may drop Mac Wi‑Fi):\n" +
+                        "1. Cable · USB controlled by Mac\n" +
+                        "2. Hotspot & tethering → USB tethering\n" +
+                        "3. Mac OpenDisplay → Android USB (tether)\n" +
+                        "   OpenDisplay demotes the phone route so\n" +
+                        "   Wi‑Fi can stay primary.",
                     color = Color(0xFF9E9E9E),
                     fontSize = 14.sp,
                     textAlign = TextAlign.Center,

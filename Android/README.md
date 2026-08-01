@@ -17,7 +17,8 @@ Same wire protocol as iOS — see [`WIRE.md`](../WIRE.md). **Network is the defa
 | mDNS discovery (`_opensidecar._tcp`) | Works when the LAN allows multicast |
 | Manual IP connect (fallback) | Works |
 | **Network mode (default)** | Wi‑Fi / LAN |
-| **USB mode** | Cable + USB debugging; Mac **Android USB** uses `adb forward` |
+| **USB mode** | **USB tethering** (no debugging) preferred; `adb` optional fallback |
+| System audio | Mac → tablet speakers when streaming |
 | Background keep-alive | Foreground service; stream survives Home / recents |
 
 ## Supported Android versions
@@ -90,13 +91,15 @@ Needs **JDK 17+** and the Android SDK.
 3. Mac OpenDisplay → pick the device, **or** manual **IP:9000** from the idle screen.
 4. Grant Mac **Screen Recording** + **Accessibility** if prompted.
 
-### USB
+### USB (recommended: adb — keeps Mac internet)
 
-1. Enable **Developer options → USB debugging** on the phone.
-2. Open this app → choose **USB**.
-3. Plug into the Mac with a data cable; accept the debugging prompt if shown.
-4. Mac OpenDisplay → **Android USB** (needs [platform-tools](https://developer.android.com/tools/releases/platform-tools) `adb` on PATH or in the usual SDK location).
-5. OpenDisplay runs `adb forward tcp:9000 tcp:9000` and dials `127.0.0.1:9000`.
+USB debugging does **not** install a Mac default route, so **Wi‑Fi keeps working**.
+
+1. Enable **Developer options → USB debugging**.
+2. Cable tablet ↔ Mac; accept the debugging prompt if shown.
+3. OpenDisplay Android app → mode **USB**.
+4. Mac OpenDisplay → **Android USB** (needs [platform-tools](https://developer.android.com/tools/releases/platform-tools) `adb` on PATH or the usual SDK location).
+5. **Do not enable USB tethering** unless adb is unavailable.
 
 Manual equivalent:
 
@@ -105,6 +108,24 @@ adb forward tcp:9000 tcp:9000
 # Mac → manual connect 127.0.0.1 port 9000
 ```
 
+### USB without debugging (tethering)
+
+Android **USB tethering** creates an RNDIS/NCM link so the Mac can reach the tablet without adb. **Side effect:** macOS often makes the phone the default route and **Wi‑Fi appears offline**. OpenDisplay then best-effort **removes only that tether default route** so Wi‑Fi is primary again while still using the cable for the display session.
+
+**Setup checklist**
+
+1. Cable tablet ↔ Mac (data cable, not charge-only).
+2. USB notification / **Settings → USB**.
+3. **USB controlled by → Connected device** (this computer).
+4. Enable **USB tethering** (**Settings → Network & internet → Hotspot & tethering → USB tethering**). Toggle off→on if the Mac row stays “accessory/charging”.
+5. OpenDisplay Android app → mode **USB**.
+6. Mac OpenDisplay → **Android USB** — label should become **“Android USB (tether)”** (not “accessory/charging”). In **System Settings → Network** you should see a **Pixel Tablet** (or similar) interface with an IPv4 address (often `192.168.42.x`).
+
+**If Mac shows the tablet on USB but “no devices” / connect fails:** the cable is up but the tablet is not in a network or adb USB mode (e.g. product id accessory `0x4EE1`). Re-enable **USB tethering**, or turn on **USB debugging**. Charge-only mode will never work.
+
+**Mac internet:** USB tethering often ranks the tablet **above Wi‑Fi** in Network Service Order (internet “dies”). While OpenDisplay is open it automatically puts **Wi‑Fi above** Pixel/Android USB services. If internet is still broken: **System Settings → Network → ⋯ → Set Service Order** → drag **Wi‑Fi** to the top, or turn tethering off.
+
+Grant Mac **Screen Recording** + **Accessibility** if prompted.
 ## Smoke checklist
 
 Run on each Android version you care about (device or emulator):

@@ -28,8 +28,8 @@ Free, open source, no subscription — alternative to Sidecar / Duet / Luna on h
 ## Features
 
 - True display extension (or mirror) via Mac OpenDisplay
-- **Network (Wi‑Fi) by default** · optional **USB** via `adb forward`
-- Hardware H.264 decode · touch + two-finger scroll · pinch-to-zoom · cursor overlay
+- **Network (Wi‑Fi) by default** · **USB via tethering** (no debugging) · optional adb fallback
+- Hardware H.264 decode · **system audio** · touch + two-finger scroll · pinch-to-zoom · cursor overlay
 - Portrait / landscape · mDNS discovery + manual IP · stays running in background
 
 ## What works
@@ -43,7 +43,8 @@ Free, open source, no subscription — alternative to Sidecar / Duet / Luna on h
 | mDNS (`_opensidecar._tcp`) | ✅ when LAN allows multicast |
 | Manual IP connect | ✅ |
 | **Network mode (default)** | ✅ Wi‑Fi / LAN |
-| **USB mode** | ✅ cable + USB debugging; Mac **Android USB** runs `adb forward` |
+| **USB mode** | ✅ **USB tethering** (no debugging) · optional `adb` fallback |
+| System audio | ✅ **Play audio on** Tablet (default) or This Mac |
 | Background keep-alive | ✅ foreground service (session survives Home) |
 
 ## Android versions
@@ -76,6 +77,13 @@ More devices: PR welcome — model, Android version, pass/fail.
 
 **Mac:** [OpenDisplay.dmg](https://github.com/peetzweg/opendisplay/releases/latest) from the main project.
 
+Local install (build + sign + copy into `/Applications`):
+
+```sh
+./install-mac.sh --open            # Debug → /Applications/OpenDisplay Dev.app
+./install-mac.sh --release --open  # Release → /Applications/OpenDisplay.app
+```
+
 **Android:**
 
 ```sh
@@ -89,8 +97,9 @@ Needs JDK 17+ and the Android SDK. Details: [`Android/README.md`](Android/README
 
 1. Open the Android app.
 2. **Network (default):** same Wi‑Fi → Mac OpenDisplay → pick the device (or **IP:9000**).
-3. **USB:** phone **USB** mode + USB debugging + cable → Mac OpenDisplay → **Android USB**
-   (requires `adb` on the Mac; OpenDisplay runs `adb forward` for you).
+3. **USB (keeps Mac Wi‑Fi):** USB debugging + `adb` → app mode **USB** → Mac **Android USB**. Prefer this over tethering.
+
+   **USB without debugging (tethering):** cable → **USB controlled by → Connected device** → enable **USB tethering** → app mode **USB** → Mac **Android USB (tether)**. Note: tethering can steal Mac internet (phone becomes default route); OpenDisplay demotes that route so Wi‑Fi stays primary. Full detail: [`Android/README.md`](Android/README.md#usb-recommended-adb--keeps-mac-internet).
 4. Grant Mac **Screen Recording** + **Accessibility** if prompted.
 
 ## How it works

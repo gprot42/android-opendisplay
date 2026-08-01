@@ -165,17 +165,32 @@ enum AndroidAdb {
 
     @discardableResult
     private static func shell(_ command: String) -> String {
+        // Non-login shell: `zsh -lc` can hang forever in a GUI app when the
+        // user profile does network/home-dir work — that blocked Android USB
+        // discovery entirely ("No devices found" with cable + tether up).
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/bin/zsh")
-        task.arguments = ["-lc", command]
+        task.arguments = ["-c", command]
+        task.environment = [
+            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+            "HOME": NSHomeDirectory(),
+        ]
         let pipe = Pipe()
         task.standardOutput = pipe
         task.standardError = pipe
         do {
             try task.run()
-            task.waitUntilExit()
         } catch {
             return "error: \(error.localizedDescription)"
+        }
+        // Hard cap so a stuck adb never freezes the poll loop.
+        let deadline = Date().addingTimeInterval(5)
+        while task.isRunning, Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        if task.isRunning {
+            task.terminate()
+            return "error: timeout"
         }
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         return String(data: data, encoding: .utf8) ?? ""

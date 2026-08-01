@@ -42,11 +42,26 @@ Every message on the TCP stream:
 
 1. If `payload` starts with `{`, length is modest (&lt; 32 KiB), and the buffer
    contains **no** `0x00` bytes → treat as **JSON control**.
-2. Otherwise → treat as a **video frame**: optional telemetry prefix + Annex B
+2. If `payload` starts with ASCII `AUD1` → treat as **system audio** (PCM).
+3. Otherwise → treat as a **video frame**: optional telemetry prefix + Annex B
    H.264.
 
-JSON never contains NUL; Annex B start codes are `00 00 00 01`, so the two are
-unambiguous.
+JSON never contains NUL; Annex B start codes are `00 00 00 01`; audio magic is
+`AUD1` — the three are unambiguous.
+
+### System audio (`AUD1`) — protocol 3+
+
+Only sent when the receiver’s `hello` includes `"audio":1`. Older peers never
+see these frames.
+
+```
+"AUD1" | u8 version=1 | u8 channels=1 | u16be sampleRate | u32be frameCount
+       | s16le mono PCM samples
+```
+
+- Default: mono, 48 000 Hz, ~20 ms chunks (960 frames).
+- Mac captures system audio via ScreenCaptureKit (`capturesAudio`); no mic
+  permission.
 
 ---
 
@@ -72,7 +87,7 @@ manual host/port connect.
 
 | Constant | Current value | Meaning |
 |---|---|---|
-| `pv` (this build) | **2** | Speaks handshake + additive fields |
+| `pv` (this build) | **3** | Handshake + optional system audio (`AUD1`) |
 | `minSupportedPeer` | **1** | Oldest peer still accepted |
 | Absent `pv` on peer | treated as **1** | Pre-handshake installs |
 
@@ -102,7 +117,8 @@ All are length-prefixed JSON objects with a string `"type"`.
   "scale": 2.0,
   "device": "Android",
   "id": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
-  "pv": 2
+  "pv": 3,
+  "audio": 1
 }
 ```
 
@@ -113,6 +129,7 @@ All are length-prefixed JSON objects with a string `"type"`.
 | `device` | no | `"iPhone"` / `"iPad"` / `"Android"` / etc. UI copy only |
 | `id` | no | Per-install UUID; Mac matches same device across transports |
 | `pv` | no | Absent ⇒ protocol 1 |
+| `audio` | no | `1` = receiver can play `AUD1` system-audio frames; Mac only sends audio then |
 
 ### `touch`
 

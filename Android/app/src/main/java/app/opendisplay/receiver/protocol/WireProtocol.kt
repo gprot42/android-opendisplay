@@ -5,7 +5,8 @@ package app.opendisplay.receiver.protocol
  * See WIRE.md at the repo root.
  */
 object WireProtocol {
-    const val VERSION = 2
+    /** 3 = optional AUD1 system-audio frames when hello advertises audio=1. */
+    const val VERSION = 3
     const val MIN_SUPPORTED_PEER = 1
     const val ASSUMED_WHEN_ABSENT = 1
 

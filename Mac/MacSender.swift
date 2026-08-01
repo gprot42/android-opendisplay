@@ -24,6 +24,30 @@ enum CaptureMode: String {
     case extend   // virtual display (Milestone 2)
 }
 
+/// Where system audio should be heard while streaming.
+enum AudioOutput: String, CaseIterable {
+    /// Stream Mac system audio to the device (default).
+    case tablet
+    /// Leave sound on the Mac only — do not send `AUD1` frames.
+    case mac
+
+    var label: String {
+        switch self {
+        case .tablet: return "Tablet"
+        case .mac: return "This Mac"
+        }
+    }
+
+    var explanation: String {
+        switch self {
+        case .tablet:
+            return "Play Mac system audio on the device only (Mac volume lowered while connected)."
+        case .mac:
+            return "Keep music and system sound on this Mac only (speakers restored)."
+        }
+    }
+}
+
 /// Capture-resolution / bitrate trade-off. The virtual display always runs at
 /// native size — only the captured/encoded stream is scaled, so lower presets
 /// cut encode, transmit, and decode time at the cost of sharpness.
@@ -82,15 +106,21 @@ struct PhoneInfo: Decodable {
                           // across USB and WiFi
     let pv: Int?          // receiver protocol version (issue #132); absent on
                           // every pre-handshake install → treat as protocol 1
+    /// 1 when the receiver can play `AUD1` system-audio frames (protocol 3+).
+    let audio: Int?
 
     var kind: String { device ?? "device" }
     var protocolVersion: Int { pv ?? WireProtocol.assumedWhenAbsent }
+    var wantsAudio: Bool { (audio ?? 0) != 0 }
 }
 
 /// How the sender reaches the receiver. Reconnects re-dial from scratch, so
 /// a USB device that was replugged (new usbmuxd DeviceID) is found again.
 enum SenderTransport {
-    case tcp(NWEndpoint)                   // WiFi (Bonjour) or -host/-port override
+    /// TCP dial. Optional `localHost` pins the source IPv4 (used for Android
+    /// USB tethering so traffic stays on the tether interface and never
+    /// reconfigures or roams onto Wi‑Fi).
+    case tcp(NWEndpoint, localHost: String? = nil)
     case usb(udid: String?, port: UInt16)  // native usbmuxd dial; nil = first device
 }
 
@@ -121,6 +151,20 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private var connection: NWConnection?
     private var virtualDisplay: VirtualDisplay?
     private let queue = DispatchQueue(label: "sender.video")
+    private let audioQueue = DispatchQueue(label: "sender.audio")
+    private let audioResampler = AudioResampler()
+    // Peer advertised audio=1 on hello; only send when audioOutput == .tablet.
+    private var peerWantsAudio = false
+    /// Escape hatch: `defaults write … streamAudio -bool false` forces off.
+    private let streamAudioAllowed = UserDefaults.standard.object(forKey: "streamAudio") == nil
+        || UserDefaults.standard.bool(forKey: "streamAudio")
+    private let audioOutput: AudioOutput
+    /// Capture + send system audio to the peer (tablet speakers).
+    private var streamAudioEnabled: Bool {
+        streamAudioAllowed && audioOutput == .tablet
+    }
+    /// True while we hold a SystemAudioMute claim (Mac speakers silenced).
+    private var holdingSpeakerMute = false
     private let startCode: [UInt8] = [0, 0, 0, 1]
 
     // The dial target. Written on `queue` only (after init): the controller
@@ -181,7 +225,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // stays gone past the grace ends the session via onDisconnected.
     private var everConnected = false
     private var disconnectedSince: Date?
-    private let disconnectGraceSeconds: TimeInterval = 10
+    /// How long to keep the virtual display + retry TCP after a blip.
+    /// Android USB / decoder hiccups often need >10s to come back.
+    private let disconnectGraceSeconds: TimeInterval = 45
 
     private var lastHello: PhoneInfo?
     private var helloContinuation: CheckedContinuation<PhoneInfo, Error>?
@@ -208,13 +254,11 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private var awaitingWake: Bool
 
     // Consecutive actively-refused dials on a previously connected session.
-    // Refusal is unambiguous: the device is reachable but nothing listens,
-    // so the app was quit (a suspended app's kernel still accepts, and a
-    // network blip times out instead of refusing). Three in a row (~3s)
-    // ends the session early; the full 10s grace stays reserved for the
-    // ambiguous failure kinds.
+    // Refusal means nothing is listening — but Android app restarts and adb
+    // forward flaps also refuse for a few seconds, so allow many retries
+    // before giving up (still capped by disconnectGraceSeconds).
     private var consecutiveRefusals = 0
-    private let refusalsBeforeGivingUp = 3
+    private let refusalsBeforeGivingUp = 20
     private var dropsTotal: Int { dropsEncTotal + dropsNetTotal }
 
     // Local cursor echo: a cursor baked into the video carries the full
@@ -247,14 +291,23 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // keyframe on — so keep the last frame around and re-encode it.
     private var lastPixelBuffer: CVPixelBuffer?
     private var lastCaptureAt = Date.distantPast
+    // After a burst of captures (window drag / resize) SCK goes quiet. The
+    // tablet can freeze on a mid-move frame that still shows the window or
+    // its title, and H.264 P-frames can leave residual macroblocks for up
+    // to MaxKeyFrameInterval. When capture idles, force an IDR + underlay
+    // nudge so the receiver settles on a clean desktop sample.
+    private var idleFlushWorkItem: DispatchWorkItem?
+    private var capturesSinceIdleFlush = 0
+    private var lastIdleFlushAt = Date.distantPast
 
     init(transport: SenderTransport, name: String, mode: CaptureMode,
-         quality: StreamQuality = .best, displaySerial: UInt32 = 0x0001,
-         awaitingWake: Bool = false) {
+         quality: StreamQuality = .best, audioOutput: AudioOutput = .tablet,
+         displaySerial: UInt32 = 0x0001, awaitingWake: Bool = false) {
         self.transport = transport
         self.endpointName = name
         self.mode = mode
         self.quality = quality
+        self.audioOutput = audioOutput
         self.displaySerial = displaySerial
         self.awaitingWake = awaitingWake
         super.init()
@@ -410,6 +463,17 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         virtualDisplay = vd
         inputInjector = InputInjector(displayID: vd.displayID)
 
+        // Solid desktop under the apps: private virtual displays often leave
+        // unpainted residue (title bar / app name) when a window is dragged
+        // off. Real pixels behind windows stop that ghosting.
+        let underlayID = vd.displayID
+        await MainActor.run {
+            DesktopUnderlay.show(on: underlayID)
+            // New displays often steal the pointer to the far left — keep the
+            // Mac trackpad usable on the built-in screen immediately.
+            WindowRecovery.warpPointerToMainDisplay()
+        }
+
         let display = try await findSCDisplay(id: vd.displayID)
         // Quality scaling: capture/encode below native when requested — the
         // display itself stays native so window layout is unaffected.
@@ -441,6 +505,17 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             stream = nil
             if let encoder { VTCompressionSessionInvalidate(encoder) }
             encoder = nil
+            let oldID = captureDisplayID
+            if oldID != 0 {
+                await MainActor.run {
+                    // Rotation rebuild: keep windows on the new panel when
+                    // possible by translating; if that fails they still land
+                    // on main rather than limbo.
+                    _ = WindowRecovery.retrieveWindows(fromDisplay: oldID, includeOffScreen: true)
+                    DesktopUnderlay.hide(on: oldID)
+                    TestPattern.hide(on: oldID)
+                }
+            }
             virtualDisplay = nil   // removes the old display
             needsKeyframe = true
             do {
@@ -491,12 +566,24 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // the encoder for ~13ms — headroom prevents SCK starvation drops.
         config.queueDepth = 8
         config.showsCursor = !localCursor
+        // Capture system audio whenever enabled; only *send* after hello
+        // advertises audio=1 (so old receivers never see AUD1 frames).
+        // Requires Screen Recording — no separate mic permission.
+        peerWantsAudio = streamAudioEnabled && (lastHello?.wantsAudio == true)
+        if streamAudioEnabled {
+            config.capturesAudio = true
+            config.sampleRate = 48_000
+            config.channelCount = 2
+        }
         applySourceRect(to: config, displayID: display.displayID)
 
         setupEncoder(width: pixelsWide, height: pixelsHigh)
 
         let stream = SCStream(filter: filter, configuration: config, delegate: self)
         try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
+        if streamAudioEnabled {
+            try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: audioQueue)
+        }
         try await stream.startCapture()
         self.stream = stream
         self.captureConfig = config
@@ -506,9 +593,23 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         lastCursorPNGHash = 0      // rotation rebuilds: re-send the sprite
         lastCursorSent = (-1, -1, false)
         startCursorEcho()
-        Log.info("capture started: \(pixelsWide)x\(pixelsHigh) display \(display.displayID) mode \(mode.rawValue) localCursor=\(localCursor)")
+        // Silence Mac speakers when routing system audio to the tablet so
+        // Firefox / Music / etc. aren't doubled on both ends.
+        updateSpeakerMute(active: peerWantsAudio && streamAudioEnabled)
+        Log.info("capture started: \(pixelsWide)x\(pixelsHigh) display \(display.displayID) mode \(mode.rawValue) localCursor=\(localCursor) audioOut=\(audioOutput.rawValue) audioCap=\(streamAudioEnabled) audioSend=\(peerWantsAudio)")
         let kind = lastHello?.kind ?? "device"
         await status("\(mode == .extend ? "Extending to" : "Mirroring to") \(kind) (\(pixelsWide)×\(pixelsHigh))")
+    }
+
+    /// Mute/unmute the Mac default output for tablet-audio sessions.
+    private func updateSpeakerMute(active: Bool) {
+        if active, !holdingSpeakerMute {
+            SystemAudioMute.claim()
+            holdingSpeakerMute = true
+        } else if !active, holdingSpeakerMute {
+            SystemAudioMute.release()
+            holdingSpeakerMute = false
+        }
     }
 
     /// Map the receiver's normalized visible rect onto the capture display
@@ -582,6 +683,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         config.pixelFormat = base.pixelFormat
         config.queueDepth = base.queueDepth
         config.showsCursor = base.showsCursor
+        config.capturesAudio = base.capturesAudio
+        config.sampleRate = base.sampleRate
+        config.channelCount = base.channelCount
         applySourceRect(to: config, displayID: captureDisplayID)
 
         Task {
@@ -624,22 +728,55 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
     func stop() {
         stopped = true
+        idleFlushWorkItem?.cancel()
+        idleFlushWorkItem = nil
         cursorTimer?.cancel()
         cursorTimer = nil
         cursorImageTimer?.cancel()
         cursorImageTimer = nil
+        updateSpeakerMute(active: false)
         stream?.stopCapture { _ in }
         stream = nil
         connection?.cancel()
         connection = nil
         if let encoder { VTCompressionSessionInvalidate(encoder) }
         encoder = nil
+        let oldID = captureDisplayID
+        // Pull windows off the virtual panel *before* tearing it down —
+        // otherwise they stay at absolute coords that no longer exist.
+        // Must be synchronous: virtualDisplay = nil removes the display.
+        if oldID != 0 {
+            let cleanup = { @MainActor in
+                _ = WindowRecovery.retrieveWindows(fromDisplay: oldID, includeOffScreen: true)
+                DesktopUnderlay.hide(on: oldID)
+                TestPattern.hide(on: oldID)
+            }
+            if Thread.isMainThread {
+                MainActor.assumeIsolated { cleanup() }
+            } else {
+                DispatchQueue.main.sync { MainActor.assumeIsolated { cleanup() } }
+            }
+        }
         virtualDisplay = nil   // releasing it removes the display
         queue.async { [weak self] in
             // Unblock a start() that is still waiting for the hello.
             self?.helloContinuation?.resume(throwing: CancellationError())
             self?.helloContinuation = nil
         }
+    }
+
+    /// Move windows currently on this session’s virtual display (or stuck
+    /// off-screen) back to the Mac main display.
+    @MainActor
+    @discardableResult
+    func retrieveWindowsToMac() -> Int {
+        let id = virtualDisplay?.displayID ?? captureDisplayID
+        let n = WindowRecovery.retrieveWindows(
+            fromDisplay: id != 0 ? id : nil,
+            includeOffScreen: true
+        )
+        Task { await status(n == 0 ? "No windows to retrieve" : "Moved \(n) window(s) back to Mac") }
+        return n
     }
 
     /// Migrate the live session to another transport: swap the socket under
@@ -800,6 +937,25 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         Log.info("stream stopped with error: \(error)")
+        // Purple menu-bar / Control Center "Stop" (SCStreamErrorUserStopped
+        // -3817). That is an intentional user action — do NOT rebuild the
+        // pipeline, or the stop button looks broken and capture restarts.
+        let ns = error as NSError
+        let userStopped = ns.domain == SCStreamErrorDomain
+            && ns.code == SCStreamError.userStopped.rawValue
+        if userStopped {
+            Log.info("user stopped screen capture from system UI — ending session")
+            // Tear the TCP link immediately so the tablet leaves the frozen
+            // desktop frame and returns to its waiting menu (don't wait for
+            // the MainActor session teardown to cancel the connection).
+            self.stream = nil
+            self.connectionReady = false
+            self.connection?.cancel()
+            self.connection = nil
+            Task { await status("Screen capture stopped") }
+            Task { @MainActor in self.onPeerClosed?() }
+            return
+        }
         Task { await status("Capture stopped: \(error.localizedDescription)") }
         // E.g. display sleep can tear the virtual display down underneath the
         // stream — rebuild instead of sitting dead until an app restart.
@@ -832,7 +988,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private func connect() {
         guard !stopped else { return }
         switch transport {
-        case .tcp(let endpoint): connectTCP(endpoint)
+        case .tcp(let endpoint, let localHost): connectTCP(endpoint, localHost: localHost)
         case .usb(let udid, let port): connectUSB(udid: udid, port: port)
         }
     }
@@ -891,11 +1047,13 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                       height: Double(pixelsHigh) * mmPerPx)
     }
 
-    private func connectTCP(_ endpoint: NWEndpoint) {
+    private func connectTCP(_ endpoint: NWEndpoint, localHost: String? = nil) {
         let options = NWProtocolTCP.Options()
         options.noDelay = true   // latency matters more than throughput here
         options.enableKeepalive = true
-        options.keepaliveIdle = 5
+        options.keepaliveIdle = 3
+        options.keepaliveInterval = 1
+        options.keepaliveCount = 3
         // Prefer a single path: multipath / Happy Eyeballs racing two
         // addresses (link-local + global IPv6) used to leave an orphan TCP
         // half-open on the receiver, which then "replaced" the live session
@@ -905,6 +1063,16 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         params.multipathServiceType = .disabled
         // Prefer the faster local path; don't roam across expensive interfaces.
         params.serviceClass = .responsiveData
+        // Android USB tether: bind source IP to the Mac’s address on the
+        // RNDIS/NCM interface so the session never uses Wi‑Fi routes and we
+        // never touch system routing/DNS (read-only discovery + user-space TCP).
+        if let localHost, !localHost.isEmpty {
+            params.requiredLocalEndpoint = NWEndpoint.hostPort(
+                host: NWEndpoint.Host(localHost),
+                port: 0)
+            params.prohibitedInterfaceTypes = [.wifi, .cellular, .loopback]
+            Log.info("TCP dial pinned to local \(localHost) (tether interface)")
+        }
 
         // Always retire the previous dial before opening another — otherwise
         // its stateUpdateHandler can still fire `.failed` and schedule a
@@ -924,8 +1092,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // Bonjour resolution, so the retry loop reaches the receiver the
         // moment it advertises again.
         let generation = dialGeneration
-        // Slightly longer timeout: Android + Wi‑Fi can take >5s after sleep.
-        queue.asyncAfter(deadline: .now() + 8.0) { [weak self] in
+        // Android USB (adb forward) + Wi‑Fi can need >8s after sleep / app restart.
+        queue.asyncAfter(deadline: .now() + 12.0) { [weak self] in
             guard let self, generation == self.dialGeneration, !self.stopped,
                   self.connection === conn, conn.state != .ready else { return }
             Log.info("dial timed out in \(conn.state) — redialing")
@@ -1032,7 +1200,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // While Screen Recording is still missing we keep dialing patiently —
         // the user may be flipping the Settings toggle; don't kill the session.
         let waitingForScreenRecording = !CGPreflightScreenCaptureAccess()
-        let grace = waitingForScreenRecording ? max(disconnectGraceSeconds, 60) : disconnectGraceSeconds
+        let grace = waitingForScreenRecording ? max(disconnectGraceSeconds, 90) : disconnectGraceSeconds
         if everConnected {
             if let since = disconnectedSince {
                 if Date().timeIntervalSince(since) > grace {
@@ -1056,8 +1224,11 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         pipelineLock.lock()
         pendingEncodes = 0
         pipelineLock.unlock()
-        // 1.5s gap reduces replace/RST thrash when both ends redial at once.
-        queue.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+        // Refresh adb forward before redialing loopback Android sessions —
+        // a dead forward presents as Connection refused and burns the grace.
+        refreshAndroidAdbForwardIfNeeded()
+        // Short gap: faster recovery after RST; still avoids dual-accept thrash.
+        queue.asyncAfter(deadline: .now() + 0.8) { [weak self] in
             // Generation-guarded so a switchTransport (or another reconnect)
             // that landed in this window supersedes this dial instead of
             // racing it — otherwise the queued connect() re-dials the new
@@ -1065,6 +1236,25 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             // self-rescheduling asyncAfter — the pattern banned in #76.)
             guard let self, generation == self.dialGeneration, !self.stopped else { return }
             self.connect()
+        }
+    }
+
+    /// If this session dials via adb port-forward (127.0.0.1), ensure the
+    /// forward still exists before the next connect().
+    private func refreshAndroidAdbForwardIfNeeded() {
+        guard case .tcp(let endpoint, _) = transport else { return }
+        // hostPort form: loopback Android USB path.
+        guard case .hostPort(let host, let port) = endpoint else { return }
+        let hostStr = "\(host)"
+        let isLoopback = hostStr == "127.0.0.1" || hostStr == "localhost" || hostStr == "::1"
+        guard isLoopback else { return }
+        let devicePort = port.rawValue
+        DispatchQueue.global(qos: .utility).async {
+            if let p = AndroidAdb.ensureForward(devicePort: devicePort) {
+                Log.info("reconnect: adb forward ok host tcp:\(p) → device tcp:\(devicePort)")
+            } else {
+                Log.info("reconnect: adb forward missing — will retry dial anyway")
+            }
         }
     }
 
@@ -1091,13 +1281,15 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private func scheduleWatchdog() {
         queue.asyncAfter(deadline: .now() + 2.0) { [weak self] in
             guard let self, !self.stopped else { return }
-            if self.connectionReady, Date().timeIntervalSince(self.lastReceived) > 5 {
+            // 8s silence before TCP recycle — 5s was too twitchy under load
+            // (decoder stalls + stats jitter look like a dead link).
+            if self.connectionReady, Date().timeIntervalSince(self.lastReceived) > 8 {
                 // A suspended receiver app (user switched apps) goes silent
                 // like this while its kernel still accepts redials — the
                 // session and display are kept on purpose so the user's
                 // window arrangement survives until they come back. Genuine
                 // network loss fails the redials and ends via the grace.
-                Log.info("watchdog: nothing from the phone for >5s — reconnecting")
+                Log.info("watchdog: nothing from the phone for >8s — reconnecting")
                 // Can't tell a backgrounded receiver from a brief stall here
                 // (both go silent while redials still succeed) — hedge.
                 Task { await self.status("\(self.endpointName) is silent — keeping the display (app in background or brief stall)") }
@@ -1114,13 +1306,57 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             }
             // A reconnect on a static screen produces no capture frames, so
             // the receiver would stay black — replay the last frame as IDR.
+            // Same path serves phone "kf" requests while the desktop is idle
+            // (e.g. after a window was dragged off and SCK stopped emitting).
             if self.connectionReady, self.needsKeyframe,
                Date().timeIntervalSince(self.lastCaptureAt) > 1,
                let pixelBuffer = self.lastPixelBuffer {
-                Log.info("static screen after reconnect — replaying last frame as keyframe")
+                Log.info("static screen — replaying last frame as keyframe")
                 self.encode(pixelBuffer, pts: CMClockGetTime(CMClockGetHostTimeClock()))
             }
             self.scheduleWatchdog()
+        }
+    }
+
+    /// After capture goes quiet, force a clean IDR so the tablet cannot keep
+    /// a mid-drag frame (title bar / app name) or P-frame residue. Also nudge
+    /// the desktop underlay so SCK re-samples the true empty desktop.
+    private func scheduleIdleFlush() {
+        idleFlushWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.performIdleFlush()
+        }
+        idleFlushWorkItem = work
+        // Window drags emit a burst then stop; 300ms is past settle without
+        // feeling laggy when the user pauses briefly.
+        queue.asyncAfter(deadline: .now() + 0.30, execute: work)
+    }
+
+    private func performIdleFlush() {
+        guard !stopped, connectionReady, mode == .extend else { return }
+        // Only after real activity — not every cursor-only tick (none with
+        // localCursor) or a single spurious frame.
+        guard capturesSinceIdleFlush >= 2 else { return }
+        // Rate-limit: continuous UI on the tablet pauses often while typing.
+        guard Date().timeIntervalSince(lastIdleFlushAt) >= 1.5 else { return }
+        guard let pixelBuffer = lastPixelBuffer else { return }
+
+        capturesSinceIdleFlush = 0
+        lastIdleFlushAt = Date()
+        needsKeyframe = true
+        encode(pixelBuffer, pts: CMClockGetTime(CMClockGetHostTimeClock()))
+        Log.info("idle flush: keyframe after capture settled (\(captureDisplayID))")
+
+        let id = captureDisplayID
+        guard id != 0 else { return }
+        Task { @MainActor in DesktopUnderlay.nudge(on: id) }
+        // Nudge may produce a fresh SCK sample ~one frame later. If not, push
+        // whatever we have again so the receiver still gets an IDR.
+        queue.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+            guard let self, !self.stopped, self.connectionReady,
+                  let pb = self.lastPixelBuffer else { return }
+            self.needsKeyframe = true
+            self.encode(pb, pts: CMClockGetTime(CMClockGetHostTimeClock()))
         }
     }
 
@@ -1252,6 +1488,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             if let info = try? JSONDecoder().decode(PhoneInfo.self, from: payload) {
                 let previous = lastHello
                 lastHello = info
+                peerWantsAudio = streamAudioEnabled && info.wantsAudio
+                updateSpeakerMute(active: peerWantsAudio)
                 Task { @MainActor in self.onHello?(info) }
                 // Version handshake (issue #132). Reply with our identity, and
                 // if the receiver is below the version we support, tell it to
@@ -1284,6 +1522,13 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                             // so the serial is free for the retry.
                             if let stream = self.stream { try? await stream.stopCapture() }
                             self.stream = nil
+                            let oldID = self.captureDisplayID
+                            if oldID != 0 {
+                                await MainActor.run {
+                                    DesktopUnderlay.hide(on: oldID)
+                                    TestPattern.hide(on: oldID)
+                                }
+                            }
                             self.virtualDisplay = nil
                             do {
                                 try await self.setupExtend(info)
@@ -1428,6 +1673,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     func stream(_ stream: SCStream,
                 didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
                 of type: SCStreamOutputType) {
+        if type == .audio {
+            handleAudioSample(sampleBuffer)
+            return
+        }
         guard type == .screen,
               CMSampleBufferIsValid(sampleBuffer),
               let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer)
@@ -1436,6 +1685,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         lastPixelBuffer = pixelBuffer
         lastCaptureAt = Date()
         capFrames += 1
+        capturesSinceIdleFlush += 1
+        // When this burst ends (window finished moving), flush an IDR so the
+        // tablet cannot keep a remnant of the previous window.
+        if mode == .extend { scheduleIdleFlush() }
 
         // No receiver, or a pipeline stage is backed up: skip this frame.
         guard connectionReady else { return }
@@ -1443,6 +1696,24 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         if shouldDropFrame(reason: "pending_sends") { return }   // TCP send queue full
 
         encode(pixelBuffer, pts: CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
+    }
+
+    private func handleAudioSample(_ sampleBuffer: CMSampleBuffer) {
+        guard peerWantsAudio, connectionReady, streamAudioEnabled else { return }
+        // Don't let audio fight a backed-up video send queue forever.
+        if pendingSends >= maxPendingSends { return }
+        guard CMSampleBufferIsValid(sampleBuffer) else { return }
+        let pcm = audioResampler.convert(sampleBuffer)
+        guard !pcm.isEmpty else { return }
+        // Chunk ~20 ms (960 @ 48 kHz) to keep latency low without tiny packets.
+        let chunk = 960
+        var i = 0
+        while i < pcm.count {
+            let end = min(i + chunk, pcm.count)
+            let slice = Array(pcm[i..<end])
+            sendFramed(AudioWire.pack(pcmS16Mono: slice))
+            i = end
+        }
     }
 
     /// Drop when encode or send pipeline is busy.

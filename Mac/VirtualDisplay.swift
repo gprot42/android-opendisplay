@@ -156,12 +156,22 @@ final class VirtualDisplay {
                 return
             }
 
+            let oldBounds = CGDisplayBounds(id)
             var config: CGDisplayConfigRef?
             guard CGBeginDisplayConfiguration(&config) == .success else { return }
             CGConfigureDisplayOrigin(config, id, Int32(target.x), Int32(target.y))
             let err = CGCompleteDisplayConfiguration(config, .permanently)
             let settled = CGDisplayBounds(id).origin
             let settledSide = DisplayArrangement.side(ofOrigin: settled, size: size)
+            let newBounds = CGDisplayBounds(id)
+            // Keep any windows the user already parked on this panel — a
+            // Left/Right snap otherwise leaves them at the old absolute
+            // coords (invisible limbo until the display is torn down).
+            if abs(newBounds.minX - oldBounds.minX) > 2 || abs(newBounds.minY - oldBounds.minY) > 2 {
+                Task { @MainActor in
+                    WindowRecovery.translateWindows(from: oldBounds, to: newBounds)
+                }
+            }
             // Only adopt micro-adjustments that stay on the preferred side.
             if settledSide == side {
                 restoreTarget = settled

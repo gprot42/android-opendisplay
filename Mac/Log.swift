@@ -13,15 +13,18 @@ enum Log {
 
     static func info(_ message: String) {
         let line = "[\(formatter.string(from: Date()))] \(message)\n"
-        print(line, terminator: "")
+        fputs(line, stdout)
+        fflush(stdout)
         queue.async {
-            if let handle = FileHandle(forWritingAtPath: path) {
-                handle.seekToEndOfFile()
-                handle.write(line.data(using: .utf8)!)
-                try? handle.close()
-            } else {
-                try? line.write(toFile: path, atomically: true, encoding: .utf8)
+            let data = Data(line.utf8)
+            if !FileManager.default.fileExists(atPath: path) {
+                FileManager.default.createFile(atPath: path, contents: data)
+                return
             }
+            guard let handle = FileHandle(forWritingAtPath: path) else { return }
+            defer { try? handle.close() }
+            _ = try? handle.seekToEnd()
+            try? handle.write(contentsOf: data)
         }
     }
 }

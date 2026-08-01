@@ -20,7 +20,11 @@ enum AppPresentation: String, CaseIterable {
 @main
 struct OpenSidecarMacApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-    @StateObject private var controller = SenderController.shared
+    // Must be ObservedObject (not StateObject): SenderController is a shared
+    // singleton. StateObject assumes the view owns the object and can miss
+    // @Published updates from background polling — which left the menu bar
+    // stuck on "No devices found" even with USB tether up.
+    @ObservedObject private var controller = SenderController.shared
 
     var body: some Scene {
         MenuBarExtra(isInserted: Binding(
@@ -49,11 +53,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Hand the updater to the control window, which is built outside the
         // SwiftUI App scene (NSHostingView), so it can offer the same button.
         MainWindow.updater = updater
+        // Force singleton init (starts Android USB polling + Bonjour) even if
+        // the MenuBarExtra body has not been evaluated yet.
+        _ = SenderController.shared
         let presentation = SenderController.shared.presentation
         NSApp.setActivationPolicy(presentation == .dock ? .regular : .accessory)
         if presentation != .menuBar {
             MainWindow.show()
         }
+        Log.info("OpenDisplay launched (presentation=\(presentation.rawValue))")
     }
 
     // Background/Dock modes: opening the app again (Spotlight, Finder, Dock
@@ -79,7 +87,7 @@ enum MainWindow {
                 contentRect: NSRect(x: 0, y: 0, width: 440, height: 540),
                 styleMask: [.titled, .closable, .miniaturizable],
                 backing: .buffered, defer: false)
-            w.title = "OpenDisplay"
+            w.title = "OpenDisplay (Android)"
             w.contentView = NSHostingView(
                 rootView: ContentView(controller: SenderController.shared,
                                       updater: updater))
@@ -195,10 +203,32 @@ final class SenderController: ObservableObject {
     // (debugging escape hatch, e.g. an iproxy or SSH tunnel).
     @Published var host = UserDefaults.standard.string(forKey: "host") ?? "127.0.0.1"
     @Published var port = UserDefaults.standard.string(forKey: "port") ?? "9000"
-    // `-mode mirror` / `-mode extend` launch argument also works.
-    @Published var mode = CaptureMode(rawValue: UserDefaults.standard.string(forKey: "mode") ?? "") ?? .extend
+    // `-mode mirror` / `-mode extend` launch argument also works (see init).
+    @Published var mode: CaptureMode = {
+        let args = ProcessInfo.processInfo.arguments
+        if let i = args.firstIndex(of: "-mode"), i + 1 < args.count,
+           let m = CaptureMode(rawValue: args[i + 1]) {
+            UserDefaults.standard.set(m.rawValue, forKey: "mode")
+            return m
+        }
+        return CaptureMode(rawValue: UserDefaults.standard.string(forKey: "mode") ?? "") ?? .extend
+    }() {
+        didSet { UserDefaults.standard.set(mode.rawValue, forKey: "mode") }
+    }
     @Published var quality = StreamQuality(rawValue: UserDefaults.standard.string(forKey: "quality") ?? "") ?? .best {
         didSet { UserDefaults.standard.set(quality.rawValue, forKey: "quality") }
+    }
+    /// Where system audio plays while streaming (default: device speakers).
+    @Published var audioOutput =
+        AudioOutput(rawValue: UserDefaults.standard.string(forKey: "audioOutput") ?? "") ?? .tablet {
+        didSet {
+            UserDefaults.standard.set(audioOutput.rawValue, forKey: "audioOutput")
+            // Switching off tablet audio must always unsilence Mac speakers,
+            // even if session teardown races the next connect.
+            if audioOutput == .mac {
+                SystemAudioMute.forceReleaseAll()
+            }
+        }
     }
     /// Place the virtual display left or right of the Mac main screen.
     @Published var displaySide = DisplayArrangement.preferredSide {
@@ -251,6 +281,7 @@ final class SenderController: ObservableObject {
     private let wifiAutoConnectDeadline = Date().addingTimeInterval(12)
 
     init() {
+        Log.info("SenderController init")
         startBrowsing()
         usbWatcher = UsbmuxDeviceWatcher { [weak self] devices in
             guard let self else { return }
@@ -260,6 +291,8 @@ final class SenderController: ObservableObject {
             self.autoConnect()
         }
         startAndroidAdbPolling()
+        startFocusWindowRetrieval()
+        Log.info("SenderController: Android USB polling started")
         Task { @MainActor in
             try? await Task.sleep(for: .seconds(2))
             self.wifiAutoConnectArmed = true
@@ -267,29 +300,121 @@ final class SenderController: ObservableObject {
         }
     }
 
-    /// Poll `adb devices` so the Android USB row appears when a phone is cabled.
+    /// When the user focuses an app from the Mac (Dock / Cmd+Tab / click)
+    /// while the pointer is on a real display, pull that app’s windows off
+    /// the virtual tablet so they aren’t “lost” on the extended screen.
+    private func startFocusWindowRetrieval() {
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            guard let self else { return }
+            Task { @MainActor in
+                self.bringActivatedAppBackIfNeeded(note)
+            }
+        }
+    }
+
+    @MainActor
+    private func bringActivatedAppBackIfNeeded(_ note: Notification) {
+        guard sessions.contains(where: { $0.sender.canHostWindows }) else { return }
+        guard WindowRecovery.pointerIsOnPhysicalDisplay() else { return }
+        guard AXIsProcessTrusted() else { return }
+        guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+                ?? note.userInfo?["NSWorkspaceApplicationKey"] as? NSRunningApplication else {
+            return
+        }
+        let pid = app.processIdentifier
+        guard pid != ProcessInfo.processInfo.processIdentifier else { return }
+        // Only windows currently on OpenDisplay virtual panels (not off-screen
+        // sweep — that would fight intentional multi-monitor layouts).
+        let n = WindowRecovery.retrieveWindows(
+            fromDisplay: nil,
+            includeOffScreen: false,
+            processID: pid
+        )
+        if n > 0 {
+            Log.info("FocusRetrieve: \(app.localizedName ?? "app") — \(n) window(s) → Mac")
+        }
+    }
+
+    /// Manual: pull every window off every virtual tablet onto the main Mac.
+    @MainActor
+    @discardableResult
+    func retrieveAllWindowsToMac() -> Int {
+        var total = 0
+        for session in sessions where session.sender.canHostWindows {
+            total += session.sender.retrieveWindowsToMac()
+        }
+        if total == 0 {
+            // No live extend session — still sweep any leftover virtual / limbo.
+            total = WindowRecovery.retrieveWindows(fromDisplay: nil, includeOffScreen: true)
+        }
+        return total
+    }
+
+    /// Poll adb / USB tether / cable presence for the Android USB row.
+    /// Heavy work (`adb`, `ioreg`, `networksetup`) runs off the main actor so
+    /// the menu-bar panel stays responsive.
     private func startAndroidAdbPolling() {
-        Task { @MainActor [weak self] in
+        Task.detached(priority: .utility) { [weak self] in
+            Log.info("Android USB poll loop entered")
             while !Task.isCancelled {
-                guard let self else { return }
-                let serials = await Task.detached(priority: .utility) {
-                    AndroidAdb.deviceSerials()
-                }.value
-                let name = await Task.detached(priority: .utility) {
-                    AndroidAdb.displayName()
-                }.value
-                self.androidUsbAvailable = !serials.isEmpty
-                self.androidUsbLabel = name ?? "Android USB"
-                // Keep adb forward alive for a live Android USB session
-                // (replug). Use ensureForward — a remove+re-add every poll
-                // would RST the open TCP stream.
-                if self.session(for: ConnectionTarget.androidUsb.sessionID) != nil,
-                   let portNum = UInt16(self.port) {
-                    await Task.detached(priority: .utility) {
-                        _ = AndroidAdb.ensureForward(devicePort: portNum)
-                    }.value
+                guard let controller = self else { return }
+                let (portNum, androidSession): (UInt16?, Bool) = await MainActor.run {
+                    (UInt16(controller.port),
+                     controller.session(for: ConnectionTarget.androidUsb.sessionID) != nil)
                 }
-                try? await Task.sleep(for: .seconds(3))
+                Log.info("Android USB poll tick")
+
+                // Discovery only first — never block the row on route/DNS fixups.
+                // Inline (this task is already off the main actor) so we don't
+                // nest another detached task that can stall scheduling.
+                let serials = AndroidAdb.deviceSerials()
+                let adbName = AndroidAdb.displayName()
+                let tether = AndroidTether.isLikelyPresent()
+                let tetherLabel = AndroidTether.displayName()
+                let cable = AndroidUsbCable.primary()
+
+                let available = tether || !serials.isEmpty || cable != nil
+                let label: String = {
+                    if !serials.isEmpty, let name = adbName { return name }
+                    if tether { return tetherLabel ?? "Android USB (tether)" }
+                    if let cable { return "\(cable.name) (USB · \(cable.shortModeHint))" }
+                    return "Android USB"
+                }()
+
+                await MainActor.run {
+                    let wasAvailable = controller.androidUsbAvailable
+                    // Always assign so SwiftUI sees a change even when Bool stays true.
+                    controller.androidUsbAvailable = available
+                    controller.androidUsbLabel = label
+                    Log.info("Android USB poll: available=\(available) label=\(label) tether=\(tether) adb=\(serials.count) cable=\(cable?.name ?? "nil")")
+                    // Cable / adb appeared or session missing: try auto-connect.
+                    if available, !androidSession {
+                        controller.autoConnect()
+                    } else if available, !wasAvailable {
+                        controller.autoConnect()
+                    }
+                }
+
+                // Internet fixups + adb forward — separate so networksetup
+                // never delays the device list. Keep the forward alive even
+                // between sessions so the next dial is not refused.
+                if available || androidSession {
+                    let serialsCopy = serials
+                    Task.detached(priority: .utility) {
+                        if tether || cable != nil || androidSession {
+                            _ = AndroidTether.preservePrimaryInternet()
+                        }
+                        if !serialsCopy.isEmpty, let portNum {
+                            _ = AndroidAdb.ensureForward(devicePort: portNum)
+                        }
+                    }
+                }
+
+                try? await Task.sleep(for: .seconds(2))
             }
         }
     }
@@ -380,6 +505,15 @@ final class SenderController: ObservableObject {
             } else if !usbDisabled.contains("usb:\(device.udid)") {
                 connect(to: .usb(udid: device.udid))
             }
+        }
+        // Android USB: auto-dial when the cable/adb path is up and the user
+        // has not explicitly disconnected. Survives brief RSTs without a
+        // manual menu click after the session ends.
+        let androidID = ConnectionTarget.androidUsb.sessionID
+        if androidUsbAvailable,
+           session(for: androidID) == nil,
+           !usbDisabled.contains(androidID) {
+            connect(to: .androidUsb)
         }
         guard wifiAutoConnectArmed, Date() < wifiAutoConnectDeadline else { return }
         for result in discovered {
@@ -496,7 +630,9 @@ final class SenderController: ObservableObject {
         case .wifi(let result):
             return serviceName(of: result) ?? "WiFi device"
         case .androidUsb:
-            return AndroidAdb.displayName() ?? "Android USB"
+            return AndroidAdb.displayName()
+                ?? AndroidTether.displayName()
+                ?? "Android USB"
         }
     }
 
@@ -561,30 +697,52 @@ final class SenderController: ObservableObject {
             transport = .tcp(result.endpoint)
         case .androidUsb:
             guard let portNum = UInt16(port) else { return }
-            // Phone listens on devicePort; adb forward maps host loopback →
-            // that port so we can dial 127.0.0.1 (must be forward, not reverse).
-            guard let hostPort = AndroidAdb.ensureForward(devicePort: portNum) else {
-                Log.info("Android USB: adb forward failed — enable USB debugging, accept the RSA prompt, and ensure platform-tools `adb` is installed")
-                // Surface a dismissible row so the click isn't a silent no-op.
+            // Prefer adb when available: no USB tethering, so macOS never gets
+            // a phone default route and Wi‑Fi/Ethernet keep working.
+            // Fall back to USB tethering only when adb is unavailable; then
+            // demote the tether default route so OpenDisplay uses the cable
+            // without stealing Mac internet.
+            if let hostPort = AndroidAdb.ensureForward(devicePort: portNum) {
+                Log.info("Android USB: using adb forward → 127.0.0.1:\(hostPort) (preferred — no tether / no route impact)")
+                // If the user also enabled USB tethering, still demote its
+                // default route so Mac internet is not stuck on the phone.
+                if AndroidTether.isLikelyPresent() {
+                    _ = AndroidTether.preservePrimaryInternet()
+                }
+                transport = .tcp(.hostPort(host: "127.0.0.1",
+                                           port: NWEndpoint.Port(rawValue: hostPort)!))
+            } else if let peer = AndroidTether.resolvePeer(port: portNum) {
+                let preserve = AndroidTether.preservePrimaryInternet()
+                Log.info("Android USB: tether peer \(peer.host):\(portNum) via \(peer.interfaceName) src=\(peer.localHost) preserve=\(preserve)")
+                transport = .tcp(
+                    .hostPort(host: NWEndpoint.Host(peer.host),
+                              port: NWEndpoint.Port(rawValue: portNum)!),
+                    localHost: peer.localHost)
+            } else {
+                let adbN = AndroidAdb.deviceSerials().count
+                let tetherUp = AndroidTether.isLikelyPresent()
+                let hint = AndroidUsbCable.failureHint(tetherPresent: tetherUp, adbDevices: adbN)
+                Log.info("Android USB: no transport — \(hint)")
                 let name = label(for: target)
                 let failed = MacSender(
                     transport: .tcp(.hostPort(host: "127.0.0.1",
                                               port: NWEndpoint.Port(rawValue: portNum)!)),
                     name: name, mode: mode, quality: quality,
+                    audioOutput: audioOutput,
                     displaySerial: Self.displaySerial(for: id),
                     awaitingWake: awaitingWake)
                 let session = DeviceSession(id: id, target: target, name: name, sender: failed)
-                session.status = "adb forward failed — USB debugging on? adb installed?"
+                // Prefix so the row renders red — this is not a live stream.
+                session.status = "Failed: \(hint)"
                 sessions.append(session)
                 return
             }
-            transport = .tcp(.hostPort(host: "127.0.0.1",
-                                       port: NWEndpoint.Port(rawValue: hostPort)!))
         }
 
         let name = label(for: target)
         let sender = MacSender(transport: transport, name: name, mode: mode,
-                               quality: quality, displaySerial: Self.displaySerial(for: id),
+                               quality: quality, audioOutput: audioOutput,
+                               displaySerial: Self.displaySerial(for: id),
                                awaitingWake: awaitingWake)
         let session = DeviceSession(id: id, target: target, name: name, sender: sender)
         if case .wifi(let result) = target {
@@ -612,11 +770,19 @@ final class SenderController: ObservableObject {
         }
         sender.onDisconnected = { [weak self, weak session] in
             // Device unplugged / left the network and stayed gone: end this
-            // session fully (virtual display + capture + indicator). No
-            // transport fallback — reconnecting is the user's call.
+            // session fully (virtual display + capture + indicator).
+            // Android USB auto-reconnects via autoConnect() when the cable
+            // is still present (unless the user hit Disconnect).
             guard let self, let session else { return }
+            let wasAndroid = if case .androidUsb = session.target { true } else { false }
             Log.info("device disconnected — session \(session.id) stopped")
             self.end(session)
+            if wasAndroid {
+                // Brief pause so the receiver can re-bind :9000, then re-dial.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                    self?.autoConnect()
+                }
+            }
         }
         sender.onPeerSleeping = { [weak self, weak session] in
             // The device locked. Unlike a plain disconnect this is a
@@ -656,7 +822,7 @@ final class SenderController: ObservableObject {
         switch session.target {
         case .usb: usbDisabled.insert(session.id)
         case .wifi: wifiRemembered.remove(session.id)
-        case .androidUsb: break
+        case .androidUsb: usbDisabled.insert(session.id)
         }
         // A migrated session is also reachable the other way — opt that side
         // out too, or auto-connect resurrects the device moments later.
@@ -680,6 +846,10 @@ final class SenderController: ObservableObject {
         let targets = sessions.map(\.target)
         sessions.forEach { $0.sender.stop() }
         sessions.removeAll()
+        // Ensure speakers are restored before a Mac-audio session starts.
+        if audioOutput == .mac {
+            SystemAudioMute.forceReleaseAll()
+        }
         targets.forEach { connect(to: $0) }
         autoConnect()   // a rebuilt WiFi session may deserve its cable back
     }
@@ -725,14 +895,19 @@ final class SenderController: ObservableObject {
         var mergedServices = Set<String>()
         var coveredSessionIDs = Set<String>()
 
-        // Android USB (adb) — only when a phone is cabled and adb is installed.
+        // Always list Android USB so a cabled/tethered tablet is never hidden
+        // behind a failed poll. Label reflects live adb/tether/cable state;
+        // Connect still explains what's missing if transport is not ready.
         // Not auto-connected: Network remains the default; user taps Connect.
-        if androidUsbAvailable || session(for: ConnectionTarget.androidUsb.sessionID) != nil {
+        do {
             let target = ConnectionTarget.androidUsb
             coveredSessionIDs.insert(target.sessionID)
+            let name = androidUsbAvailable
+                ? androidUsbLabel
+                : "Android USB (plug in · enable tether or USB debugging)"
             entries.append(DeviceEntry(
                 id: target.sessionID,
-                name: androidUsbLabel,
+                name: name,
                 androidUsbTarget: target))
         }
 
@@ -881,7 +1056,7 @@ struct ContentView: View {
                     .resizable()
                     .frame(width: 44, height: 44)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("OpenDisplay")
+                    Text("OpenDisplay (Android)")
                         .font(.title3.bold())
                     Text("Your iPads and iPhones as extra displays")
                         .font(.caption)
@@ -934,7 +1109,7 @@ struct ContentView: View {
             Form {
                 Section("Devices") {
                     if controller.deviceEntries.isEmpty {
-                        Text("No devices found — plug one in via USB, or open the OpenDisplay app on a device on this WiFi network.")
+                        Text("No devices found — same Wi‑Fi + OpenDisplay on the tablet, or USB: enable USB debugging (adb) or USB tethering (Mac needs a tether IP; charge-only / accessory mode will not work).")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -993,6 +1168,19 @@ struct ContentView: View {
                              : "Tablet sits right of the Mac — move the mouse right to reach it.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
+                        Text("Apps dragged to the tablet stay there. To use them on the Mac again: move the pointer back to this screen and click the app in the Dock / Cmd+Tab, or press Retrieve Windows below.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        if controller.sessions.contains(where: { $0.sender.canHostWindows }) {
+                            Button {
+                                let n = controller.retrieveAllWindowsToMac()
+                                _ = n
+                            } label: {
+                                Label("Retrieve Windows to Mac", systemImage: "rectangle.portrait.and.arrow.left")
+                            }
+                            .controlSize(.small)
+                            .help("Move every window currently on the tablet (or stuck off-screen) back onto your Mac. Needs Accessibility permission.")
+                        }
                     }
                 }
 
@@ -1004,6 +1192,19 @@ struct ContentView: View {
                     }
                     .onChange(of: controller.quality) { controller.restartAll() }
                     Text(controller.quality.explanation)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Picker("Play audio on", selection: $controller.audioOutput) {
+                        ForEach(AudioOutput.allCases, id: \.self) { out in
+                            Text(out.label).tag(out)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .onChange(of: controller.audioOutput) { controller.restartAll() }
+                    Text(controller.audioOutput.explanation)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -1198,6 +1399,14 @@ struct SessionRow: View {
                     }
                     .controlSize(.small)
                     .help("Move the frontmost app’s window onto this device. Click the app first (not OpenDisplay), then press Send Window. Needs Accessibility permission.")
+
+                    Button {
+                        _ = session.sender.retrieveWindowsToMac()
+                    } label: {
+                        Label("Retrieve", systemImage: "rectangle.portrait.and.arrow.left")
+                    }
+                    .controlSize(.small)
+                    .help("Move windows from this device (or stuck off-screen) back onto your Mac display. Also: click the app in the Dock while the pointer is on the Mac. Needs Accessibility permission.")
                 }
 
                 Button {

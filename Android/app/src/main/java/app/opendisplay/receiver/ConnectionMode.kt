@@ -3,8 +3,10 @@ package app.opendisplay.receiver
 import android.content.Context
 
 /**
- * How the Mac reaches this receiver. Network (Wi‑Fi / LAN) is the default;
- * USB uses a cable + `adb forward` (or USB tethering) on the Mac side.
+ * How the Mac reaches this receiver. Network (Wi‑Fi / LAN) is the default.
+ * USB: Mac prefers **adb forward** when USB debugging is on (no impact on Mac
+ * internet); falls back to **USB tethering** and demotes the tether default
+ * route so Wi‑Fi stays primary.
  */
 enum class ConnectionMode {
     NETWORK,
