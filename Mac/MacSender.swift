@@ -735,6 +735,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         cursorImageTimer?.cancel()
         cursorImageTimer = nil
         updateSpeakerMute(active: false)
+        inputInjector?.forceRelease()
         stream?.stopCapture { _ in }
         stream = nil
         connection?.cancel()
@@ -770,13 +771,22 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     @MainActor
     @discardableResult
     func retrieveWindowsToMac() -> Int {
+        releaseInjectedPointer()
         let id = virtualDisplay?.displayID ?? captureDisplayID
         let n = WindowRecovery.retrieveWindows(
             fromDisplay: id != 0 ? id : nil,
             includeOffScreen: true
         )
+        if n > 0 {
+            WindowRecovery.warpPointerToMainDisplay()
+        }
         Task { await status(n == 0 ? "No windows to retrieve" : "Moved \(n) window(s) back to Mac") }
         return n
+    }
+
+    /// Clear a tablet-driven mouse-down and restore the Mac cursor.
+    func releaseInjectedPointer() {
+        inputInjector?.forceRelease()
     }
 
     /// Migrate the live session to another transport: swap the socket under
@@ -1215,6 +1225,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         connectionReady = false
         dialGeneration += 1   // a USB dial still in flight must not adopt
         let generation = dialGeneration
+        // Never leave a synthetic mouse-down held across a reconnect.
+        inputInjector?.forceRelease()
         if let previous = connection {
             previous.stateUpdateHandler = nil
             previous.cancel()

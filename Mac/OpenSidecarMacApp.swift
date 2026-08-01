@@ -314,28 +314,46 @@ final class SenderController: ObservableObject {
                 self.bringActivatedAppBackIfNeeded(note)
             }
         }
+        // Typing / clicking on the Mac should free a stuck tablet mouse capture.
+        NSEvent.addGlobalMonitorForEvents(matching: [.keyDown, .leftMouseDown, .rightMouseDown]) { [weak self] _ in
+            guard let self else { return }
+            Task { @MainActor in
+                guard self.sessions.contains(where: { $0.sender.canHostWindows }) else { return }
+                for session in self.sessions {
+                    session.sender.releaseInjectedPointer()
+                }
+            }
+        }
     }
 
     @MainActor
     private func bringActivatedAppBackIfNeeded(_ note: Notification) {
         guard sessions.contains(where: { $0.sender.canHostWindows }) else { return }
-        guard WindowRecovery.pointerIsOnPhysicalDisplay() else { return }
-        guard AXIsProcessTrusted() else { return }
         guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
                 ?? note.userInfo?["NSWorkspaceApplicationKey"] as? NSRunningApplication else {
             return
         }
         let pid = app.processIdentifier
         guard pid != ProcessInfo.processInfo.processIdentifier else { return }
-        // Only windows currently on OpenDisplay virtual panels (not off-screen
-        // sweep — that would fight intentional multi-monitor layouts).
+
+        // Always clear a tablet-driven mouse capture when the user focuses
+        // something from the Mac side (Dock / Cmd+Tab / click).
+        for session in sessions {
+            session.sender.releaseInjectedPointer()
+        }
+
+        guard AXIsProcessTrusted() else { return }
+        // Pull this app’s windows off the virtual tablet even if the cursor
+        // is still stranded there — otherwise Cmd+Tab “selects” iTerm2 with
+        // no visible window on the laptop screen.
         let n = WindowRecovery.retrieveWindows(
             fromDisplay: nil,
-            includeOffScreen: false,
+            includeOffScreen: true,
             processID: pid
         )
         if n > 0 {
             Log.info("FocusRetrieve: \(app.localizedName ?? "app") — \(n) window(s) → Mac")
+            WindowRecovery.warpPointerToMainDisplay()
         }
     }
 
@@ -1168,7 +1186,7 @@ struct ContentView: View {
                              : "Tablet sits right of the Mac — move the mouse right to reach it.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
-                        Text("Apps dragged to the tablet stay there. To use them on the Mac again: move the pointer back to this screen and click the app in the Dock / Cmd+Tab, or press Retrieve Windows below.")
+                        Text("Apps on the tablet stay there. Touching the tablet moves the Mac cursor onto it — lift your finger and the cursor returns here. Cmd+Tab / Dock or Retrieve Windows brings windows back to the Mac.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                         if controller.sessions.contains(where: { $0.sender.canHostWindows }) {
