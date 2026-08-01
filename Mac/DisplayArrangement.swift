@@ -52,12 +52,12 @@ enum DisplayArrangement {
     /// side of the main display (vertically centered). WindowServer may snap
     /// the final position to a valid adjacent arrangement.
     static func origin(for size: CGSize, device: String) -> CGPoint? {
-        // Prefer the explicit Left/Right setting so orientation / transport
-        // identity churn doesn’t shuffle the phone to a random corner.
-        // Per-device drag memory still records via `save` for diagnostics
-        // and a future “remember last” mode, but does not override the setting.
         _ = device
-        return sideOrigin(preferredSide, size: size)
+        let side = preferredSide
+        let o = sideOrigin(side, size: size)
+        Log.info("display arrangement side=\(side.rawValue) origin=(\(Int(o.x)),\(Int(o.y))) "
+            + "size=\(Int(size.width))x\(Int(size.height))")
+        return o
     }
 
     /// Point-origin so the virtual display sits flush against the main
@@ -69,10 +69,20 @@ enum DisplayArrangement {
         let y = main.minY + max(0, (main.height - size.height) / 2)
         switch side {
         case .right:
+            // Flush against the right edge of the main display.
             return CGPoint(x: main.maxX, y: y)
         case .left:
+            // Flush against the left edge (negative X when main is at 0).
             return CGPoint(x: main.minX - size.width, y: y)
         }
+    }
+
+    /// Which side of the main display a virtual panel currently occupies,
+    /// based on its center X vs the main display’s center.
+    static func side(ofOrigin origin: CGPoint, size: CGSize) -> DisplaySide {
+        let main = CGDisplayBounds(CGMainDisplayID())
+        let centerX = origin.x + size.width / 2
+        return centerX < main.midX ? .left : .right
     }
 
     /// Record the origin (global desktop points) the display settled at.

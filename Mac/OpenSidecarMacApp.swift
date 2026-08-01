@@ -988,7 +988,9 @@ struct ContentView: View {
                         }
                         .pickerStyle(.segmented)
                         .onChange(of: controller.displaySide) { controller.restartAll() }
-                        Text("Places the device \(controller.displaySide == .left ? "to the left" : "to the right") of your Mac when connecting. Drag a window past that edge of the Mac screen, or use Send Window on the session. Fine-tune in System Settings → Displays.")
+                        Text(controller.displaySide == .left
+                             ? "Tablet sits left of the Mac — move the mouse left to reach it."
+                             : "Tablet sits right of the Mac — move the mouse right to reach it.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }

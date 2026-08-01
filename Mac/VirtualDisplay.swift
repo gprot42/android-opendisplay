@@ -12,9 +12,14 @@ final class VirtualDisplay {
     let pointsHigh: Int
 
     private var restoreTarget: CGPoint?
+    /// Preferred side; re-asserted for the full restore window even when
+    /// WindowServer snaps to the opposite side (common with stale macOS
+    /// arrangement memory for our vendor/product/serial).
+    private let preferredSide: DisplaySide?
     private let restoreUntil: Date
     private var lastReportedOrigin: CGPoint?
     private let onOriginChange: ((CGPoint) -> Void)?
+    private var lastWrongSideLog = Date.distantPast
 
     var displayID: CGDirectDisplayID { display.displayID }
 
@@ -27,11 +32,15 @@ final class VirtualDisplay {
     /// caller can persist user drags.
     init?(name: String, pointsWide: Int, pointsHigh: Int, sizeInMillimeters: CGSize,
           serialNum: UInt32 = 0x0001, restoreOrigin: CGPoint? = nil,
+          preferredSide: DisplaySide? = nil,
           onOriginChange: ((CGPoint) -> Void)? = nil) {
         self.pointsWide = pointsWide
         self.pointsHigh = pointsHigh
         self.restoreTarget = restoreOrigin
-        self.restoreUntil = restoreOrigin == nil ? .distantPast : Date().addingTimeInterval(6)
+        self.preferredSide = preferredSide ?? DisplayArrangement.preferredSide
+        // 12s: macOS often re-applies its own arrangement several seconds
+        // after the display appears; a short window loses the fight.
+        self.restoreUntil = restoreOrigin == nil ? .distantPast : Date().addingTimeInterval(12)
         self.onOriginChange = onOriginChange
 
         let descriptor = CGVirtualDisplayDescriptor()
@@ -120,24 +129,54 @@ final class VirtualDisplay {
     /// swaps the serial, transport switches change it) — the caller's
     /// device-keyed record must win. Afterwards, origin changes are the user
     /// rearranging: report them so the caller can persist the new spot.
+    ///
+    /// Important: do **not** adopt a WindowServer snap that lands on the
+    /// opposite side of the Mac from the user's Left/Right preference — that
+    /// made "Left" sessions still require mousing right onto the tablet.
     private func manageOrigin() {
         let id = display.displayID
+        let size = CGSize(width: pointsWide, height: pointsHigh)
         let origin = CGDisplayBounds(id).origin
-        if let target = restoreTarget, Date() < restoreUntil {
-            guard origin != target else { return }
+
+        if Date() < restoreUntil, let side = preferredSide {
+            // Always recompute from live main bounds — main can move if the
+            // user rearranges, and a stale absolute target can point "right"
+            // of a relocated main.
+            let target = DisplayArrangement.sideOrigin(side, size: size)
+            restoreTarget = target
+            let currentSide = DisplayArrangement.side(ofOrigin: origin, size: size)
+            let onPreferredSide = currentSide == side
+            // Allow a few points of snap/alignment noise once on the right side.
+            let closeEnough = abs(origin.x - target.x) < 4 && abs(origin.y - target.y) < 8
+            if onPreferredSide && closeEnough {
+                if origin != lastReportedOrigin {
+                    lastReportedOrigin = origin
+                    onOriginChange?(origin)
+                }
+                return
+            }
+
             var config: CGDisplayConfigRef?
             guard CGBeginDisplayConfiguration(&config) == .success else { return }
             CGConfigureDisplayOrigin(config, id, Int32(target.x), Int32(target.y))
             let err = CGCompleteDisplayConfiguration(config, .permanently)
-            // WindowServer snaps the requested origin to the nearest valid
-            // arrangement — adopt what it settled on, or every remaining
-            // tick of the window would re-apply against the snap.
-            restoreTarget = CGDisplayBounds(id).origin
-            Log.info("display \(id) origin (\(Int(origin.x)),\(Int(origin.y))) → restored "
-                + "(\(Int(target.x)),\(Int(target.y))), settled "
-                + "(\(Int(restoreTarget!.x)),\(Int(restoreTarget!.y))) (result \(err.rawValue))")
+            let settled = CGDisplayBounds(id).origin
+            let settledSide = DisplayArrangement.side(ofOrigin: settled, size: size)
+            // Only adopt micro-adjustments that stay on the preferred side.
+            if settledSide == side {
+                restoreTarget = settled
+            }
+            // Rate-limit logs — this can fire every 200ms while fighting macOS.
+            if settledSide != side || !onPreferredSide, Date().timeIntervalSince(lastWrongSideLog) > 1 {
+                lastWrongSideLog = Date()
+                Log.info("display \(id) prefer \(side.rawValue) origin (\(Int(origin.x)),\(Int(origin.y))) "
+                    + "→ target (\(Int(target.x)),\(Int(target.y))), settled "
+                    + "(\(Int(settled.x)),\(Int(settled.y))) side=\(settledSide.rawValue) "
+                    + "(result \(err.rawValue))")
+            }
             return
         }
+
         if origin != lastReportedOrigin {
             lastReportedOrigin = origin
             onOriginChange?(origin)

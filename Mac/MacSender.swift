@@ -387,15 +387,17 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             // `if stopped` checks in the permission-poll loops above.)
             if stopped { return }
             vd = await MainActor.run {
-                VirtualDisplay(name: displayName,
-                               pointsWide: pointsWide, pointsHigh: pointsHigh,
-                               sizeInMillimeters: mm, serialNum: serial,
-                               restoreOrigin: DisplayArrangement.origin(for: sizeInPoints,
-                                                                        device: arrangementKey),
-                               onOriginChange: { origin in
-                                   DisplayArrangement.save(origin: origin, size: sizeInPoints,
-                                                           device: arrangementKey)
-                               })
+                let side = DisplayArrangement.preferredSide
+                let origin = DisplayArrangement.origin(for: sizeInPoints, device: arrangementKey)
+                return VirtualDisplay(name: displayName,
+                                      pointsWide: pointsWide, pointsHigh: pointsHigh,
+                                      sizeInMillimeters: mm, serialNum: serial,
+                                      restoreOrigin: origin,
+                                      preferredSide: side,
+                                      onOriginChange: { origin in
+                                          DisplayArrangement.save(origin: origin, size: sizeInPoints,
+                                                                  device: arrangementKey)
+                                      })
             }
             if vd != nil { break }
             Log.info("virtual display creation failed (attempt \(attempt + 1)) — retrying")
