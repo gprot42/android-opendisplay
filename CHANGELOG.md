@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.0](https://github.com/gprot42/android-opendisplay/compare/v0.0.2...v0.1.0) (2026-08-01)
+
+
+### Features
+
+* **android:** reverse connect, GrapheneOS VPN help, v0.0.2 ([6f568c1](https://github.com/gprot42/android-opendisplay/commit/6f568c136e8b028accd2955855dd5817cd2c8eb6))
+
 ## [1.14.0](https://github.com/peetzweg/opendisplay/compare/v1.13.0...v1.14.0) (2026-07-30)
 
 
