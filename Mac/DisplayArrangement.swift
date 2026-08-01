@@ -41,7 +41,7 @@ enum DisplayArrangement {
     /// Global preference: place extended screens left or right of the Mac.
     static var preferredSide: DisplaySide {
         get {
-            DisplaySide(rawValue: UserDefaults.standard.string(forKey: sideKey) ?? "") ?? .right
+            DisplaySide(rawValue: UserDefaults.standard.string(forKey: sideKey) ?? "") ?? .left
         }
         set {
             UserDefaults.standard.set(newValue.rawValue, forKey: sideKey)
