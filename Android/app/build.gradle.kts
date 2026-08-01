@@ -69,7 +69,7 @@ android {
     }
 }
 
-// Versioned APK names, e.g. OpenDisplay-0.0.1-debug.apk
+// Versioned APK names, e.g. OpenDisplay-0.0.2-debug.apk
 android.applicationVariants.configureEach {
     val variant = this
     outputs.configureEach {

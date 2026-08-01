@@ -18,18 +18,22 @@ class NsdAdvertiser(context: Context) {
     private var registration: NsdManager.RegistrationListener? = null
     private var registeredName: String? = null
     private var multicastLock: WifiManager.MulticastLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
     private var registrationRetries = 0
 
     fun register(serviceName: String, port: Int, installId: String, protocolVersion: Int = WireProtocol.VERSION) {
         unregister()
         registrationRetries = 0
         acquireMulticastLock()
+        acquireWifiLock()
         val info = NsdServiceInfo().apply {
             this.serviceName = serviceName.ifBlank { "OpenDisplay" }
             this.serviceType = WireProtocol.SERVICE_TYPE
             this.port = port
             setAttribute("id", installId)
             setAttribute("pv", protocolVersion.toString())
+            // Lets the Mac treat this Bonjour hit as signature-verified.
+            setAttribute("sig", "OpenDisplay")
         }
 
         val listener = object : NsdManager.RegistrationListener {
@@ -81,6 +85,31 @@ class NsdAdvertiser(context: Context) {
         }
         registeredName = null
         releaseMulticastLock()
+        releaseWifiLock()
+    }
+
+    /** Keep Wi‑Fi radio up while advertising / listening for the Mac. */
+    private fun acquireWifiLock() {
+        if (wifiLock?.isHeld == true) return
+        try {
+            val wifi = appContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager ?: return
+            @Suppress("DEPRECATION")
+            val lock = wifi.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "opendisplay-wifi")
+            lock.setReferenceCounted(false)
+            lock.acquire()
+            wifiLock = lock
+            Log.i(tag, "Wi‑Fi high-perf lock acquired")
+        } catch (e: Exception) {
+            Log.w(tag, "wifi lock: ${e.message}")
+        }
+    }
+
+    private fun releaseWifiLock() {
+        try {
+            wifiLock?.takeIf { it.isHeld }?.release()
+        } catch (_: Exception) {
+        }
+        wifiLock = null
     }
 
     /** Multicast lock keeps mDNS advertisements reachable on many OEM Wi‑Fi stacks. */

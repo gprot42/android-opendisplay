@@ -156,6 +156,37 @@ enum AndroidAdb {
         forward(devicePort: port, serial: serial) != nil
     }
 
+    /// Device→host tunnel: tablet `localhost:devicePort` → Mac `localhost:hostPort`.
+    ///
+    /// Used for **reverse connect** (Mac listens on :9011, tablet dials). This is
+    /// the opposite of ``ensureForward``. Safe while the tablet app listens on
+    /// :9000 — we reverse a different port.
+    @discardableResult
+    static func ensureReverse(devicePort: UInt16, hostPort: UInt16, serial: String? = nil) -> Bool {
+        guard let adb = adbPath else { return false }
+        let serials = deviceSerials()
+        guard !serials.isEmpty else { return false }
+        let target = serial.flatMap { serials.contains($0) ? $0 : nil } ?? serials[0]
+        // Idempotent: list existing reverses.
+        let list = shell("\(adb) -s \(target) reverse --list")
+        let needle = "tcp:\(devicePort)"
+        let hostNeedle = "tcp:\(hostPort)"
+        if list.contains(needle) && list.contains(hostNeedle) {
+            Log.info("adb reverse tcp:\(devicePort) → host tcp:\(hostPort) on \(target): already set")
+            return true
+        }
+        _ = shell("\(adb) -s \(target) reverse --remove tcp:\(devicePort)")
+        let out = shell("\(adb) -s \(target) reverse tcp:\(devicePort) tcp:\(hostPort)")
+        let lower = out.lowercased()
+        let ok = !lower.contains("error") && !lower.contains("failed")
+        if ok {
+            Log.info("adb reverse tcp:\(devicePort) → host tcp:\(hostPort) on \(target): ok")
+        } else {
+            Log.info("adb reverse failed: \(out.trimmingCharacters(in: .whitespacesAndNewlines))")
+        }
+        return ok
+    }
+
     private static func prop(serial: String, key: String) -> String? {
         guard let adb = adbPath else { return nil }
         let v = shell("\(adb) -s \(serial) shell getprop \(key)")

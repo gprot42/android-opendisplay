@@ -1,82 +1,105 @@
-# OpenDisplay for Android
+# OpenDisplay for GrapheneOS
 
-Use an Android phone or tablet as a **second monitor** for a Mac running
-[OpenDisplay](https://github.com/peetzweg/opendisplay).
+Use a **[GrapheneOS](https://grapheneos.org/)** phone or tablet as a **second
+monitor** for a Mac running this OpenDisplay Mac app (or upstream
+[peetzweg/opendisplay](https://github.com/peetzweg/opendisplay)).
 
-Same wire protocol as iOS — see [`WIRE.md`](../WIRE.md). **Network is the default**; USB is optional.
+This receiver is an Android APK, but **this fork is tested and documented for
+GrapheneOS**, not stock OEM Android.
 
-## What works
+Same wire protocol as iOS — see [`WIRE.md`](../WIRE.md). **Network is the
+default**; USB is optional.
+
+## Features
+
+**Display**
+
+- Extend (virtual Mac display) or Mirror
+- Hardware H.264 decode (`MediaCodec`)
+- Portrait / landscape
+
+**Connect**
+
+- **Wi‑Fi / LAN** — listen on **:9000**; Mac dials when peer TCP works
+- **mDNS** — advertise `_opensidecar._tcp` with TXT `sig=OpenDisplay`
+- **Reverse connect** — when Mac→device TCP is blocked (AP isolation, guest
+  Wi‑Fi, many VPNs), the Mac listens on **:9011** (`_opendisplay-mac._tcp`)
+  and this app **dials the Mac**. Same stream protocol after TCP is up.
+  With USB debugging attached, Mac can set `adb reverse tcp:9011` so the
+  device dials `127.0.0.1:9011` if pure Wi‑Fi outbound is blocked.
+- **VPN help in-app** — idle **Can't connect over Wi‑Fi?** explains
+  Always-on vs lockdown and opens system VPN settings (apps cannot
+  disable the kill switch).
+- **USB + adb** — `adb forward tcp:9000` (Mac dials loopback)
+- **USB tethering** — optional path without debugging
+
+**Why reverse connect?**  
+Classic Sidecar-style apps assume the computer can open a TCP connection to
+the tablet. Home/guest routers often allow discovery (mDNS/ping) but **drop
+peer TCP**. Reverse connect flips dial direction so streaming can still work
+on those networks.
+
+**Input & audio**
+
+- Touch click / drag / two-finger scroll; pinch-zoom
+- Mac cursor overlay
+- System audio to device speakers when enabled on the Mac
+
+**Reliability**
+
+- Foreground service; stream survives Home / recents
+
+## What works (GrapheneOS)
 
 | Feature | Status |
 |---|---|
 | TCP listen on port **9000** + `hello` | Works |
 | H.264 hardware decode (MediaCodec) | Works |
 | Touch click / drag + two-finger scroll | Works |
-| Pinch-to-zoom + one-finger pan when zoomed + double-tap reset | Works |
-| Mac cursor overlay (local cursor echo) | Works |
-| mDNS discovery (`_opensidecar._tcp`) | Works when the LAN allows multicast |
-| Manual IP connect (fallback) | Works |
-| **Network mode (default)** | Wi‑Fi / LAN |
-| **USB mode** | **USB tethering** (no debugging) preferred; `adb` optional fallback |
-| System audio | Mac → tablet speakers when streaming |
-| Background keep-alive | Foreground service; stream survives Home / recents |
+| Pinch-to-zoom + pan when zoomed + double-tap reset | Works |
+| Mac cursor overlay | Works |
+| mDNS (`_opensidecar._tcp` + signature) | Works when LAN allows multicast |
+| **Reverse connect** (dial Mac `:9011`) | Works when device→Mac TCP (or adb reverse) works |
+| Manual IP connect | Works when Mac→device TCP works |
+| USB + adb | Works |
+| USB tethering | Works (may affect Mac internet) |
+| System audio | Mac → device when streaming |
+| Background keep-alive | Foreground service |
 
-## Supported Android versions
+## Platform
 
 | | |
 |---|---|
-| **Minimum** | **Android 8.0** (API **26**) |
-| **Target** | Android 15 (API 35) |
-| **Recommended** | Android **11+** (API 30+) for official low-latency decode |
+| **Target OS** | **GrapheneOS** on supported Pixel devices |
+| **Minimum API** | **26** (build baseline; GrapheneOS is far newer) |
+| **Target API** | **35** |
+| **Required** | Hardware **H.264 / AVC** decoder |
 
-### Why API 26?
+### Verified
 
-- Covers almost all tablets still in use.
-- Hardware H.264 (`MediaCodec`) and mDNS (`NsdManager`) are solid from API 26.
-- Jetpack Compose + AndroidX backports UI/window APIs so we don’t need a higher minSdk for chrome.
-
-### Version notes
-
-| Android | API | Decode latency | Discovery | Notes |
-|---|---|---|---|---|
-| 8–9 | 26–28 | Vendor low-latency keys only | NSD | Expect higher latency; use Mac quality **Fast** on Wi‑Fi |
-| 10 | 29 | Vendor keys | NSD | Same as above |
-| **11+** | **30+** | `KEY_LOW_LATENCY` + vendors | NSD | Best path |
-| 12 | 31–32 | Same | NSD | Some OEMs isolate “guest” Wi‑Fi — use manual IP if Mac can’t see the device |
-| 13 | 33 | Same | NSD | Declares `NEARBY_WIFI_DEVICES` (never for location) |
-| 14 | 34 | Same | NSD | Same low-latency path as 11+ |
-| 15 | 35 | Same | NSD | **targetSdk**; same as 11+ |
-| 16 | 36 | Same | NSD | Runs above targetSdk; verified on Pixel 10 Pro XL |
-
-**Required on the device:** a hardware **H.264 / AVC** decoder (every normal phone/tablet has one). Soft decoders are not targeted.
-
-### Verified so far
-
-| Device | Android | Result |
+| Device | OS | Result |
 |---|---|---|
-| Pixel 10 Pro XL | 16 / API 36* | Stream + touch + cursor (Wi‑Fi + USB via `adb forward`) |
-| **Google Pixel Tablet** (10.95″, 2560×1600) | 15 / API 35* | Stream + touch + cursor (Wi‑Fi + USB via `adb forward`) |
+| **Google Pixel Tablet** | **GrapheneOS** | Stream + touch + cursor (reverse network / USB) |
 
-\*Installs that report a higher API than `targetSdk` still run; we only require **≥ 26**.
+Stock Android / other OEMs are **not** the documented support surface. PRs
+welcome for other GrapheneOS-supported Pixels.
 
-Add your device after testing (PR welcome): model, Android version, Wi‑Fi or `adb forward`, pass/fail.
+## How we keep builds working
 
-## How we keep multi-version working
-
-1. **minSdk 26** — compile against API 35, never call APIs below min without a version guard.
-2. **Decode** — use `KEY_LOW_LATENCY` only on API 30+; apply common vendor low-latency keys; if configure fails, **retry a plain** MediaCodec config (some OEMs reject vendor keys).
-3. **Network** — cleartext TCP allowed on LAN (`network_security_config`); same host:port as iOS.
-4. **Discovery is optional** — idle screen always shows **IP:port** so a Mac can connect when mDNS is blocked.
-5. **Startup probe** — logs Android version, ABI, and AVC decoder name (`adb logcat -s DeviceReport H264Decoder`).
-6. **CI** — unit tests (framing / Annex B) + debug APK assemble on every push (see `.github/workflows/android.yml`).
-7. **Manual matrix** — before a release, run the [smoke checklist](#smoke-checklist) on at least one API 26–28 emulator and one API 30+ device/emulator.
+1. **minSdk 26 / targetSdk 35** — GrapheneOS runs a current API; we still version-guard platform APIs.
+2. **Decode** — `KEY_LOW_LATENCY` on API 30+; vendor keys with plain MediaCodec fallback.
+3. **Network** — cleartext TCP on LAN (`network_security_config`); classic listen `:9000` plus reverse dial to Mac `:9011`.
+4. **Discovery is optional** — idle screen always shows **IP:port** when mDNS is blocked.
+5. **Startup probe** — logs API level, ABI, AVC decoder (`adb logcat -s DeviceReport H264Decoder`).
+6. **CI** — unit tests + debug APK assemble (see `.github/workflows/android.yml`).
+7. **Manual smoke** — [checklist](#smoke-checklist) on GrapheneOS (Pixel Tablet or phone) before release.
 
 ## Build & install
 
 ```sh
 cd Android
 ./gradlew :app:assembleDebug
-# Version from ../version.md → ~/OpenDisplay-0.0.1-debug.apk
+# Version from ../version.md → ~/OpenDisplay-0.0.2-debug.apk
 adb install -r ~/OpenDisplay-*-debug.apk
 ```
 
@@ -86,20 +109,26 @@ Needs **JDK 17+** and the Android SDK.
 
 ### Network (default)
 
-1. Open this app → leave **Network** selected.
-2. Same Wi‑Fi as the Mac.
-3. Mac OpenDisplay → pick the device, **or** manual **IP:9000** from the idle screen.
+1. Open this app on GrapheneOS (leave it on the waiting screen).
+2. Same Wi‑Fi as the Mac (avoid guest Wi‑Fi / VPNs that block LAN if you can).
+3. Mac OpenDisplay → **Connect over network** (IP filled from discovery when possible).
 4. Grant Mac **Screen Recording** + **Accessibility** if prompted.
 
-### USB (recommended: adb — keeps Mac internet)
+**If classic dial fails** (`nc <tablet-ip> 9000` times out): reverse connect
+kicks in — Mac listens on **9011**, this app dials the Mac. Keep the app open.
+With USB debugging connected, Mac may use `adb reverse tcp:9011` so the app
+can dial `127.0.0.1:9011` when pure Wi‑Fi peer traffic is blocked.
+
+### USB (adb — keeps Mac internet)
 
 USB debugging does **not** install a Mac default route, so **Wi‑Fi keeps working**.
 
-1. Enable **Developer options → USB debugging**.
-2. Cable tablet ↔ Mac; accept the debugging prompt if shown.
-3. OpenDisplay Android app → mode **USB**.
-4. Mac OpenDisplay → **Android USB** (needs [platform-tools](https://developer.android.com/tools/releases/platform-tools) `adb` on PATH or the usual SDK location).
-5. **Do not enable USB tethering** unless adb is unavailable.
+1. Enable **Developer options → USB debugging** (GrapheneOS: Developer options as usual).
+2. Cable device ↔ Mac; accept the debugging prompt if shown.
+3. Mac OpenDisplay → **Android USB** / adb path (needs
+   [platform-tools](https://developer.android.com/tools/releases/platform-tools)
+   `adb` on PATH or the usual SDK location).
+4. **Do not enable USB tethering** unless adb is unavailable.
 
 Manual equivalent:
 
@@ -128,13 +157,13 @@ Android **USB tethering** creates an RNDIS/NCM link so the Mac can reach the tab
 Grant Mac **Screen Recording** + **Accessibility** if prompted.
 ## Smoke checklist
 
-Run on each Android version you care about (device or emulator):
+Run on GrapheneOS (Pixel Tablet or supported phone):
 
 - [ ] App launches; idle screen shows port **9000** and a LAN IP (or `adb forward` path).
 - [ ] `adb logcat -s DeviceReport` shows **H.264 decoder: …** (not MISSING).
-- [ ] Mac connects (discovery **or** manual IP).
+- [ ] Mac connects (discovery, reverse, **or** manual IP / USB).
 - [ ] Extended display appears; desktop is visible (not black for >3s).
-- [ ] Mouse cursor visible on the Android screen when the pointer is on that display.
+- [ ] Mouse cursor visible on the device when the pointer is on that display.
 - [ ] Tap = click, drag = drag, two-finger pan = scroll.
 - [ ] Rotate device once; Mac rebuilds the display (may briefly reconnect).
 - [ ] Leave app (home); session ends cleanly; reopen and reconnect.
@@ -154,11 +183,53 @@ Emulator networking to a Mac on the host: use the emulator’s IP as shown in th
 
 | Symptom | What to try |
 |---|---|
-| Mac doesn’t list the device | Use **manual IP:9000**; check same LAN / disable VPN / AP client isolation |
-| Black screen | Confirm decoder in logcat; on Mac pick quality **Fast**; wait for keyframe |
-| No cursor | Update to a build that includes cursor overlay; move pointer onto the virtual display |
-| High latency | Prefer 5 GHz Wi‑Fi; Mac quality **Balanced** or **Fast**; Android 11+ helps |
-| Connect then drop | Keep app foreground; don’t lock the screen mid-session |
+| Mac doesn’t list the device | Same LAN; Local Network on Mac; manual **IP:9000**; VPN / AP isolation |
+| Wi‑Fi fails; USB / `adb reverse` works | OS VPN **lockdown** — see [below](#grapheneos-vpn-lockdown) |
+| `nc <ip> 9000` times out | Peer TCP blocked — fix lockdown, reverse connect, or USB/adb |
+| Reverse connects then drops | Keep app open; allow LAN in VPN apps; avoid guest Wi‑Fi |
+| Black screen | Decoder in logcat; Mac quality **Fast**; wait for keyframe |
+| No cursor | Move pointer onto the virtual display |
+| High latency | Prefer 5 GHz Wi‑Fi; Mac quality **Balanced** or **Fast** |
+| Connect then drop | Keep app foreground; don’t lock screen mid-session |
+| VPN / ExpressVPN / Nord | OS lockdown **off** and app **Allow LAN** / Network Lock off |
+
+### GrapheneOS VPN lockdown
+
+GrapheneOS turns **both** toggles on when you first set up any VPN:
+
+| Toggle | What it does |
+|---|---|
+| **Always-on VPN** | Keeps that VPN selected; may restart the tunnel |
+| **Block connections without VPN** | Kill switch — only VPN paths allowed |
+
+**Block connections without VPN** (lockdown) is the one that breaks
+Mac ↔ tablet Wi‑Fi:
+
+- Blocks LAN peer TCP (classic `:9000` and reverse `:9011`)
+- Still blocks when the VPN app looks **disconnected**
+- VPN-app “Allow LAN” does **not** override OS lockdown
+- `adb reverse` + dial `127.0.0.1` can still work (loopback, not LAN)
+
+**Turn it off for pure Wi‑Fi:**
+
+1. **Settings → Network & internet → VPN**
+2. Tap the **gear** on each listed VPN
+3. Turn **off** **Block connections without VPN**
+4. Optionally turn **Always-on VPN** off too
+5. Toggle Wi‑Fi, then retry **Connect over network**
+
+In OpenDisplay, **Can't connect over Wi‑Fi?** on the idle screen shows
+these steps and opens **VPN settings**. A normal app **cannot** change
+this toggle (Device Owner / user only).
+
+Also in the VPN app: enable **Allow LAN** / **Local network sharing**
+and disable any Network Lock / app kill switch if present.
+
+| Goal | Always-on | Block without VPN |
+|---|---|---|
+| Max privacy on the go | ON | ON |
+| Home LAN + OpenDisplay Wi‑Fi | optional | **OFF** |
+| VPN only when you open the app | OFF | OFF |
 
 ## Permissions
 

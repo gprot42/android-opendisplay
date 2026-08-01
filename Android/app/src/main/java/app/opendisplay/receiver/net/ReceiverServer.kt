@@ -1,5 +1,8 @@
 package app.opendisplay.receiver.net
 
+import android.content.Context
+import android.net.ConnectivityManager
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
@@ -23,6 +26,8 @@ import org.json.JSONObject
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.net.Inet4Address
+import java.net.InetAddress
+import java.net.InetSocketAddress
 import java.net.NetworkInterface
 import java.net.ServerSocket
 import java.net.Socket
@@ -67,6 +72,7 @@ data class ReceiverUiState(
  * OpenDisplay wire protocol (WIRE.md).
  */
 class ReceiverServer(
+    context: Context,
     private val installId: String,
     private val onState: (ReceiverUiState) -> Unit,
     private val decoder: H264Decoder,
@@ -77,6 +83,7 @@ class ReceiverServer(
     private val onCursorReset: () -> Unit = {},
 ) {
     private val tag = "ReceiverServer"
+    private val appContext = context.applicationContext
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val mainHandler = Handler(Looper.getMainLooper())
     private val writeMutex = Mutex()
@@ -140,6 +147,117 @@ class ReceiverServer(
         running = true
         this.port = port
         acceptJob = scope.launch { listenLoop() }
+    }
+
+    /**
+     * Dial the Mac (reverse path). Used when the AP blocks Mac→tablet TCP but
+     * the tablet can still open a connection to the Mac (Bonjour-discovered).
+     * Same wire protocol as an accepted inbound session.
+     *
+     * Must bind the socket to the **Wi‑Fi Network** — with USB/adb attached,
+     * Android often returns EACCES for unbound LAN dials (`from /::`).
+     */
+    fun connectOutbound(host: String, port: Int) {
+        if (!running) return
+        // If already connected only via adb loopback (127.0.0.1), allow reverse
+        // to take over so Wi‑Fi path can be tested while the cable is plugged
+        // for debugging. Real Wi‑Fi peers keep their session.
+        val existing = clientSocket.get()
+        val existingPeer = existing?.inetAddress?.hostAddress
+        if (state.connected && existingPeer != null &&
+            existingPeer != "127.0.0.1" && existingPeer != "::1"
+        ) {
+            Log.i(tag, "connectOutbound skipped — already connected to $existingPeer")
+            return
+        }
+        if (state.connected && (existingPeer == "127.0.0.1" || existingPeer == "::1")) {
+            Log.i(tag, "connectOutbound replacing adb/loopback session with reverse $host:$port")
+        }
+        scope.launch {
+            // Prefer loopback first (adb reverse); then LAN IP for pure Wi‑Fi.
+            val candidates = linkedSetOf<String>()
+            if (port == WireProtocol.MAC_REVERSE_PORT) {
+                candidates.add("127.0.0.1")
+            }
+            candidates.add(host)
+            var lastError: Exception? = null
+            for (candidate in candidates) {
+                try {
+                    Log.i(tag, "dialing Mac $candidate:$port (reverse)")
+                    publish(state.copy(status = "Connecting to Mac $candidate:$port…", connected = false))
+                    val socket = openWifiBoundSocket(candidate, port)
+                    closeClient("outbound-replace")
+                    clientSocket.set(socket)
+                    sessionJob?.cancel()
+                    sessionJob = scope.launch { runSession(socket) }
+                    return@launch
+                } catch (e: Exception) {
+                    lastError = e
+                    Log.w(tag, "connectOutbound $candidate:$port failed: ${e.message}")
+                }
+            }
+            publish(
+                state.copy(
+                    status = "Mac unreachable — ${lastError?.message ?: "no route"}",
+                    connected = false,
+                    streaming = false,
+                ),
+            )
+        }
+    }
+
+    /**
+     * Loopback = adb reverse (no Wi‑Fi bind). LAN uses [WifiNetworkHolder].
+     */
+    private fun openWifiBoundSocket(host: String, port: Int): Socket {
+        val isLoopback = host == "127.0.0.1" || host == "::1" || host.equals("localhost", true)
+        if (isLoopback) {
+            val socket = Socket()
+            socket.tcpNoDelay = true
+            socket.keepAlive = true
+            socket.connect(InetSocketAddress(host, port), 2_000)
+            Log.i(tag, "outbound loopback OK local=${socket.localSocketAddress}")
+            return socket
+        }
+
+        val target = preferIPv4(host)
+            ?: throw java.net.UnknownHostException("no address for $host")
+        val network = WifiNetworkHolder.network(timeoutMs = 5_000)
+            ?: throw java.io.IOException("no Wi‑Fi Network for app — disable VPN lockdown / allow network")
+
+        val cm = appContext.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+        Log.i(tag, "using network=$network active=${cm?.activeNetwork}")
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && cm != null) {
+            try {
+                cm.bindProcessToNetwork(network)
+            } catch (e: Exception) {
+                Log.w(tag, "bindProcessToNetwork: ${e.message}")
+            }
+        }
+
+        val socket = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            network.socketFactory.createSocket(target, port)
+        } else {
+            Socket(target, port)
+        }
+        socket.tcpNoDelay = true
+        socket.keepAlive = true
+        socket.soTimeout = 0
+        Log.i(
+            tag,
+            "outbound OK local=${socket.localSocketAddress} remote=${socket.remoteSocketAddress}",
+        )
+        return socket
+    }
+
+    private fun preferIPv4(host: String): InetAddress? {
+        return try {
+            val all = InetAddress.getAllByName(host)
+            all.firstOrNull { it is Inet4Address } ?: all.firstOrNull()
+        } catch (_: Exception) {
+            null
+        }
     }
 
     fun stop() {
@@ -245,21 +363,22 @@ class ReceiverServer(
                 // "address already in use" after a quick restart.
                 val server = ServerSocket()
                 server.reuseAddress = true
-                server.bind(java.net.InetSocketAddress(port))
-                // Accept both IPv4 and IPv6; Mac may dial either after Bonjour.
+                // Explicit wildcard so Wi‑Fi clients can connect (not only loopback/USB).
+                server.bind(java.net.InetSocketAddress("0.0.0.0", port))
                 serverSocket = server
+                val addrs = localIpv4Addresses()
                 publish(
                     state.copy(
                         status = "Waiting for Mac…",
                         listening = true,
                         connected = false,
                         streaming = false,
-                        localAddresses = localIpv4Addresses(),
+                        localAddresses = addrs,
                         port = port,
                         serviceName = serviceName,
                     ),
                 )
-                Log.i(tag, "listening on $port")
+                Log.i(tag, "listening on 0.0.0.0:$port addrs=$addrs")
 
                 while (scope.isActive && running) {
                     val socket = try {

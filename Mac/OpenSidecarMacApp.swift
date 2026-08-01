@@ -165,14 +165,49 @@ final class SenderController: ObservableObject {
 
     @Published var sessions: [DeviceSession] = []
     @Published var discovered: [NWBrowser.Result] = []
+    /// Verified OpenDisplay receivers (UDP signature ack). Never plain ARP.
+    @Published var lanHits: [NetworkDiscovery.Hit] = []
+    /// Bonjour service name → resolved IPv4:port (shown in UI, used to Connect).
+    @Published var bonjourAddresses: [String: BonjourResolve.Address] = [:]
+    /// Live discovery status for the UI.
+    @Published var discoveryStatus = "Starting network discovery…"
     @Published var usbDevices: [UsbmuxDevice] = []
     /// adb-visible Android devices (for the Android USB row).
     @Published var androidUsbAvailable = false
     @Published var androidUsbLabel = "Android USB"
     // `-host x.x.x.x` / `-port n` bypass usbmuxd with a manual TCP endpoint
     // (debugging escape hatch, e.g. an iproxy or SSH tunnel).
-    @Published var host = UserDefaults.standard.string(forKey: "host") ?? "127.0.0.1"
-    @Published var port = UserDefaults.standard.string(forKey: "port") ?? "9000"
+    /// Manual network endpoint (tablet LAN IP). Empty = not configured.
+    @Published var host = UserDefaults.standard.string(forKey: "host") ?? ""
+    /// Always plain digits (never locale-grouped like "9'000" under Swiss locale).
+    @Published var port: String = {
+        let raw = UserDefaults.standard.string(forKey: "port") ?? "9000"
+        let digits = raw.filter(\.isNumber)
+        return digits.isEmpty ? "9000" : digits
+    }()
+
+    /// Port for UI / dial — digits only, no locale thousands separators.
+    static func plainPortDigits(_ raw: String, fallback: String = "9000") -> String {
+        let digits = raw.filter(\.isNumber)
+        return digits.isEmpty ? fallback : digits
+    }
+
+    static func plainPortString(_ port: UInt16) -> String {
+        // Avoid any locale-aware conversion path; FixedWidthInteger description is ASCII.
+        String(port)
+    }
+    /// Auto-connect when a tablet is discovered on the network (Bonjour or LAN scan).
+    @Published var networkAutoConnect: Bool = {
+        if UserDefaults.standard.object(forKey: "networkAutoConnect") == nil {
+            return true
+        }
+        return UserDefaults.standard.bool(forKey: "networkAutoConnect")
+    }() {
+        didSet {
+            UserDefaults.standard.set(networkAutoConnect, forKey: "networkAutoConnect")
+            if networkAutoConnect { autoConnect() }
+        }
+    }
     // `-mode mirror` / `-mode extend` launch argument also works (see init).
     @Published var mode: CaptureMode = {
         let args = ProcessInfo.processInfo.arguments
@@ -242,6 +277,11 @@ final class SenderController: ObservableObject {
     private var wifiRemembered = Set(UserDefaults.standard.stringArray(forKey: "wifiRemembered") ?? []) {
         didSet { UserDefaults.standard.set(Array(wifiRemembered), forKey: "wifiRemembered") }
     }
+    /// User hit Disconnect on a network session — don't auto-grab again until they Connect.
+    private var wifiDisabled = Set(UserDefaults.standard.stringArray(forKey: "wifiDisabled") ?? []) {
+        didSet { UserDefaults.standard.set(Array(wifiDisabled), forKey: "wifiDisabled") }
+    }
+    private var lanScanTask: Task<Void, Never>?
     // Install id learned from each USB device's hello, persisted, so the
     // same hardware is recognized across transports even when the user
     // renamed the advertised service. @Published so the device list regroups
@@ -264,6 +304,8 @@ final class SenderController: ObservableObject {
     init() {
         Log.info("SenderController init")
         startBrowsing()
+        // Re-scan when user edits the port field.
+        // (networkAutoConnect didSet already calls autoConnect.)
         usbWatcher = UsbmuxDeviceWatcher { [weak self] devices in
             guard let self else { return }
             let detached = Set(self.usbDevices.map(\.udid)).subtracting(devices.map(\.udid))
@@ -450,18 +492,234 @@ final class SenderController: ObservableObject {
     }
 
     private func startBrowsing() {
+        NetworkDiscovery.triggerLocalNetworkPermissionPrompt()
+
         // TXT records carry the receiver's install id (new receivers).
         let browser = NWBrowser(for: .bonjourWithTXTRecord(type: "_opensidecar._tcp", domain: nil), using: .tcp)
+        browser.stateUpdateHandler = { [weak self] newState in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                switch newState {
+                case .ready:
+                    self.discoveryStatus = "Looking for tablets on the network…"
+                    Log.info("Bonjour: browser ready (_opensidecar._tcp)")
+                case .failed(let error):
+                    self.discoveryStatus = "Network discovery failed — allow Local Network in Settings"
+                    Log.info("Bonjour: browser failed: \(error)")
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+                        self?.restartBrowsing()
+                    }
+                case .waiting(let error):
+                    self.discoveryStatus = "Waiting for Local Network permission…"
+                    Log.info("Bonjour: waiting: \(error)")
+                case .cancelled:
+                    break
+                default:
+                    break
+                }
+            }
+        }
         browser.browseResultsChangedHandler = { [weak self] results, _ in
             DispatchQueue.main.async {
                 guard let self else { return }
-                self.discovered = Array(results)
+                // Prefer receivers that advertise TXT sig=OpenDisplay (new apps).
+                // Always keep _opensidecar._tcp results — the type itself is the brand.
+                let list = Array(results)
+                self.discovered = list
+                if list.isEmpty {
+                    if self.lanHits.isEmpty {
+                        self.discoveryStatus = "Looking for tablets on the network…"
+                    }
+                } else {
+                    let names = list.compactMap { self.serviceName(of: $0) }.joined(separator: ", ")
+                    let signed = list.filter { self.txtSig(of: $0) == "OpenDisplay" }.count
+                    self.refreshDiscoveryStatus()
+                    Log.info("Bonjour: discovered \(list.count) signed=\(signed) — \(names)")
+                    self.resolveBonjourAddresses(list)
+                }
+                // Drop addresses for services that vanished.
+                let liveNames = Set(list.compactMap { self.serviceName(of: $0) })
+                self.bonjourAddresses = self.bonjourAddresses.filter { liveNames.contains($0.key) }
                 self.endSessionsWhoseServiceVanished()
                 self.autoConnect()
             }
         }
         browser.start(queue: .main)
         self.browser = browser
+        startLanScanLoop()
+    }
+
+    private func restartBrowsing() {
+        browser?.cancel()
+        browser = nil
+        startBrowsing()
+    }
+
+    /// Periodic LAN port scan (no hard-coded IPs). ARP-first so a live tablet
+    /// is usually found in well under a second; full /24 only if needed.
+    private func startLanScanLoop() {
+        lanScanTask?.cancel()
+        let portNum = UInt16(port) ?? 9000
+        lanScanTask = Task { [weak self] in
+            // Brief pause so Bonjour + Local Network TCC can settle.
+            try? await Task.sleep(for: .milliseconds(300))
+            var cycle = 0
+            while !Task.isCancelled {
+                guard let self else { return }
+                await MainActor.run {
+                    if self.discovered.isEmpty && self.lanHits.isEmpty {
+                        self.discoveryStatus = "Scanning for OpenDisplay signature…"
+                    }
+                }
+                let started = Date()
+                // Full /24 every 6th cycle; otherwise ARP candidates only (UDP probe).
+                let full = (cycle % 6 == 0)
+                let result = await NetworkDiscovery.scanLAN(port: portNum, fullSweep: full)
+                cycle += 1
+                let elapsed = String(format: "%.2f", Date().timeIntervalSince(started))
+                guard !Task.isCancelled else { return }
+                await MainActor.run {
+                    let previous = Set(self.lanHits.map(\.host))
+                    if full {
+                        self.lanHits = result.hits
+                    } else if !result.hits.isEmpty {
+                        var byHost = Dictionary(uniqueKeysWithValues: self.lanHits.map { ($0.host, $0) })
+                        for h in result.hits { byHost[h.host] = h }
+                        self.lanHits = byHost.values.sorted {
+                            $0.host.localizedStandardCompare($1.host) == .orderedAscending
+                        }
+                    }
+                    // Bonjour `_opensidecar._tcp` (+ TXT sig) is the primary signature on
+                    // APs that block peer UDP; never wipe it when LAN probe returns 0.
+                    self.refreshDiscoveryStatus()
+                    if !self.lanHits.isEmpty, Set(self.lanHits.map(\.host)) != previous {
+                        let label = self.lanHits.map { "\($0.name) (\($0.host))" }.joined(separator: ", ")
+                        Log.info("LAN verified (\(elapsed)s): \(label)")
+                    }
+                    if !self.lanHits.isEmpty || !self.discovered.isEmpty {
+                        self.autoConnect()
+                    }
+                }
+                let found = await MainActor.run { !self.lanHits.isEmpty }
+                try? await Task.sleep(for: .seconds(found ? 10 : 2))
+            }
+        }
+    }
+
+    /// User-triggered immediate scan (UDP probe + keep Bonjour signature hits).
+    func rescanNetwork() {
+        let portNum = UInt16(port) ?? 9000
+        discoveryStatus = "Scanning for OpenDisplay signature…"
+        Task { [weak self] in
+            let result = await NetworkDiscovery.scanLAN(port: portNum, fullSweep: true)
+            await MainActor.run {
+                guard let self else { return }
+                self.lanHits = result.hits
+                self.refreshDiscoveryStatus(preferLanDetail: true)
+                if !self.lanHits.isEmpty || !self.discovered.isEmpty {
+                    self.autoConnect()
+                }
+            }
+        }
+    }
+
+    /// Status line: UDP hits and/or Bonjour `_opensidecar` + TXT `sig=OpenDisplay`.
+    /// Never report “not found” when Bonjour already verified a receiver.
+    private func refreshDiscoveryStatus(preferLanDetail: Bool = false) {
+        let bonjourNames = discovered.compactMap { serviceName(of: $0) }
+        let signed = discovered.filter { txtSig(of: $0) == "OpenDisplay" }
+        let signedNames = signed.compactMap { serviceName(of: $0) }
+
+        if !lanHits.isEmpty {
+            let label = lanHits.map { "\($0.name) (\($0.host))" }.joined(separator: ", ")
+            discoveryStatus = "Verified signature: \(label)"
+        } else if !signedNames.isEmpty {
+            let parts = signedNames.map { name -> String in
+                if let a = bonjourAddresses[name] {
+                    return "\(name) (\(a.host))"
+                }
+                return name
+            }
+            discoveryStatus = "Verified Bonjour: \(parts.joined(separator: ", "))"
+        } else if !bonjourNames.isEmpty {
+            discoveryStatus = "Found \(bonjourNames.count): \(bonjourNames.joined(separator: ", "))"
+        } else if preferLanDetail {
+            discoveryStatus =
+                "No OpenDisplay signature yet — open the tablet app on the same Wi‑Fi"
+        } else {
+            discoveryStatus = "Looking for tablets on the network…"
+        }
+    }
+
+    /// Resolve Bonjour services to IPv4 so the UI can show host:port and Connect can dial IP.
+    private func resolveBonjourAddresses(_ list: [NWBrowser.Result]) {
+        for result in list {
+            guard let name = serviceName(of: result) else { continue }
+            guard txtSig(of: result) == "OpenDisplay" else { continue }
+            // Skip if we already have a fresh address.
+            if bonjourAddresses[name] != nil { continue }
+            Task { [weak self] in
+                guard let addr = await BonjourResolve.resolve(result: result) else {
+                    Log.info("Bonjour resolve: no address for \(name)")
+                    return
+                }
+                await MainActor.run {
+                    guard let self else { return }
+                    let prev = self.bonjourAddresses[name]
+                    self.bonjourAddresses[name] = addr
+                    if prev?.host != addr.host {
+                        Log.info("Bonjour resolve: \(name) → \(addr.host):\(addr.port)")
+                        // Prefill manual IP so one-tap “Connect over network” works.
+                        if self.host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            || self.host == prev?.host {
+                            self.host = addr.host
+                            self.port = Self.plainPortString(addr.port)
+                        }
+                        self.refreshDiscoveryStatus()
+                    }
+                }
+            }
+        }
+    }
+
+    /// Bonjour results not already covered by a UDP lanHit (by service name).
+    var bonjourVerifiedEntries: [(id: String, name: String, host: String?, port: UInt16, result: NWBrowser.Result)] {
+        let lanNames = Set(lanHits.map(\.name))
+        return discovered.compactMap { result -> (String, String, String?, UInt16, NWBrowser.Result)? in
+            guard let name = serviceName(of: result) else { return nil }
+            guard txtSig(of: result) == "OpenDisplay" else { return nil }
+            guard !lanNames.contains(name) else { return nil }
+            let addr = bonjourAddresses[name]
+            return ("bonjour:\(name)", name, addr?.host, addr?.port ?? 9000, result)
+        }
+    }
+
+    /// Connect to a signature-verified Bonjour tablet via resolved IP (or Bonjour endpoint).
+    /// Does not fall over to USB — network and USB are separate paths.
+    func connectVerifiedBonjour(name: String, result: NWBrowser.Result, userInitiated: Bool = true) {
+        // Prefer resolved host:port — clearer status + fills the IP field.
+        if let addr = bonjourAddresses[name] {
+            Log.info("connectVerifiedBonjour: \(name) → \(addr.host):\(addr.port)")
+            connectNetwork(host: addr.host, port: String(addr.port))
+            return
+        }
+        Task { [weak self] in
+            let addr = await BonjourResolve.resolve(result: result)
+            await MainActor.run {
+                guard let self else { return }
+                if let addr {
+                    self.bonjourAddresses[name] = addr
+                    self.host = addr.host
+                    self.port = Self.plainPortString(addr.port)
+                    self.refreshDiscoveryStatus()
+                    Log.info("connectVerifiedBonjour: resolved \(name) → \(addr.host):\(addr.port)")
+                    self.connectNetwork(host: addr.host, port: Self.plainPortString(addr.port))
+                } else {
+                    Log.info("connectVerifiedBonjour: resolve failed — Bonjour endpoint dial")
+                    self.connect(to: .wifi(result), userInitiated: userInitiated)
+                }
+            }
+        }
     }
 
     // MARK: - Physical-device identity
@@ -473,6 +731,11 @@ final class SenderController: ObservableObject {
 
     private func txtID(of result: NWBrowser.Result) -> String? {
         if case .bonjour(let txt) = result.metadata { return txt["id"] }
+        return nil
+    }
+
+    private func txtSig(of result: NWBrowser.Result) -> String? {
+        if case .bonjour(let txt) = result.metadata { return txt["sig"] }
         return nil
     }
 
@@ -520,11 +783,13 @@ final class SenderController: ObservableObject {
     private func autoConnect() {
         guard autoConnectEnabled else { return }
         dedupeSessions()
-        // The -host/-port escape hatch is an explicit choice — dial it like
-        // the wired devices (it joins them, not replaces them).
-        if UserDefaults.standard.object(forKey: "host") != nil,
-           !usbDisabled.contains("usb:first"), session(for: "usb:first") == nil {
-            connect(to: .usb(udid: nil))
+        // Saved network host: use connectNetwork (reverse-first), not a bare
+        // Mac→tablet dial that hangs forever under AP isolation.
+        if networkAutoConnect,
+           !host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           !usbDisabled.contains("usb:first"),
+           session(for: "usb:first") == nil {
+            connectNetwork()
         }
         for device in usbDevices {
             if let covering = activeSession(coveringUSB: device) {
@@ -536,22 +801,71 @@ final class SenderController: ObservableObject {
                 connect(to: .usb(udid: device.udid))
             }
         }
-        // Android USB: auto-dial when the cable/adb path is up and the user
-        // has not explicitly disconnected. Survives brief RSTs without a
-        // manual menu click after the session ends.
+        // Android USB auto-connect — only when we are not driving a network
+        // reverse session. With a saved host + network auto-connect, USB must
+        // not race adb-forward onto :9000 and block tablet→Mac reverse dial.
         let androidID = ConnectionTarget.androidUsb.sessionID
+        let networkHostSet = !host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let networkSessionActive = session(for: "usb:first") != nil
         if androidUsbAvailable,
            session(for: androidID) == nil,
-           !usbDisabled.contains(androidID) {
+           !usbDisabled.contains(androidID),
+           !(networkAutoConnect && networkHostSet),
+           !networkSessionActive {
             connect(to: .androidUsb)
         }
-        guard wifiAutoConnectArmed, Date() < wifiAutoConnectDeadline else { return }
-        for result in discovered {
-            let target = ConnectionTarget.wifi(result)
-            if wifiRemembered.contains(target.sessionID),
-               activeSession(coveringWiFi: result) == nil,
-               !cabled(result) {
-                connect(to: target)
+
+        // Network auto-connect (independent of USB transport).
+        // Prefer resolved IPv4 host:port over raw Bonjour endpoints (clearer dials).
+        if networkAutoConnect {
+            // Don't start a second hanging Wi‑Fi session if one is already retrying.
+            let alreadyWifi = sessions.contains { if case .wifi = $0.target { return true }; return false }
+            let alreadyManual = session(for: ConnectionTarget.usb(udid: nil).sessionID) != nil
+            if !alreadyWifi && !alreadyManual {
+                // Resolved Bonjour → dial IP.
+                if let (name, addr) = bonjourAddresses.sorted(by: { $0.key < $1.key }).first {
+                    let id = "wifi:\(name)"
+                    if !wifiDisabled.contains(id), !wifiDisabled.contains("network:\(addr.host)") {
+                        Log.info("autoConnect: Bonjour \(name) @ \(addr.host):\(addr.port)")
+                        connectNetwork(host: addr.host, port: String(addr.port))
+                    }
+                } else {
+                    for result in discovered {
+                        let target = ConnectionTarget.wifi(result)
+                        let id = target.sessionID
+                        guard activeSession(coveringWiFi: result) == nil else { continue }
+                        guard !cabled(result) else { continue }
+                        guard !wifiDisabled.contains(id) else { continue }
+                        if sessions.contains(where: { $0.deviceID != nil && $0.deviceID == txtID(of: result) }) {
+                            continue
+                        }
+                        if let name = serviceName(of: result), txtSig(of: result) == "OpenDisplay" {
+                            Log.info("autoConnect: network \(name) (awaiting IP resolve)")
+                            connectVerifiedBonjour(name: name, result: result, userInitiated: false)
+                            break
+                        }
+                    }
+                }
+            }
+            // Signature-verified LAN hits → TCP path.
+            if session(for: ConnectionTarget.usb(udid: nil).sessionID) == nil {
+                for hit in lanHits {
+                    guard !wifiDisabled.contains("network:\(hit.host)") else { continue }
+                    Log.info("autoConnect: verified \(hit.name) @ \(hit.host):\(hit.port)")
+                    connectNetwork(host: hit.host, port: String(hit.port))
+                    break
+                }
+            }
+        } else if wifiAutoConnectArmed, Date() < wifiAutoConnectDeadline {
+            // Auto-network off: only reconnect remembered Wi‑Fi at launch.
+            for result in discovered {
+                let target = ConnectionTarget.wifi(result)
+                if wifiRemembered.contains(target.sessionID),
+                   activeSession(coveringWiFi: result) == nil,
+                   !cabled(result),
+                   !wifiDisabled.contains(target.sessionID) {
+                    connect(to: target)
+                }
             }
         }
     }
@@ -656,7 +970,7 @@ final class SenderController: ObservableObject {
             if let device = usbDevices.first(where: { $0.udid == udid }), let name = device.name {
                 return name
             }
-            return udid == nil ? "Manual (\(host):\(port))" : "iPhone / iPad"
+            return udid == nil ? "Network (\(host):\(port))" : "iPhone / iPad"
         case .wifi(let result):
             return serviceName(of: result) ?? "WiFi device"
         case .androidUsb:
@@ -677,6 +991,102 @@ final class SenderController: ObservableObject {
         var hash: UInt32 = 2_166_136_261
         for byte in id.utf8 { hash = (hash ^ UInt32(byte)) &* 16_777_619 }
         return hash == 0 ? 1 : hash
+    }
+
+    /// Port the Mac listens on when the tablet must dial us (reverse / AP isolation).
+    static let reverseListenPort: UInt16 = 9011
+
+    /// Dial a tablet over Wi‑Fi / LAN using the IP shown on the Android app
+    /// idle screen (port 9000 by default). Persists host/port for reconnect.
+    ///
+    /// Network-only (no USB failover).
+    ///
+    /// 1. Start **reverse listen** immediately (tablet dials Mac) — works when
+    ///    the AP blocks Mac→tablet TCP.
+    /// 2. In parallel, probe direct host:port; if open, switch to a normal dial.
+    func connectNetwork(host rawHost: String? = nil, port rawPort: String? = nil) {
+        let h = (rawHost ?? host).trimmingCharacters(in: .whitespacesAndNewlines)
+        let p = Self.plainPortDigits((rawPort ?? port).trimmingCharacters(in: .whitespacesAndNewlines))
+        guard !h.isEmpty, let portNum = UInt16(p), portNum > 0 else {
+            Log.info("connectNetwork: need host and port (got host=\(h) port=\(p))")
+            return
+        }
+        host = h
+        port = p
+        UserDefaults.standard.set(h, forKey: "host")
+        UserDefaults.standard.set(p, forKey: "port")
+        wifiDisabled.remove("network:\(h)")
+        // Replace any existing manual network session.
+        if let existing = session(for: ConnectionTarget.usb(udid: nil).sessionID) {
+            end(existing)
+        }
+
+        // Reverse-first: Mac listens; tablet (MacHostBrowser) dials in.
+        Log.info("connectNetwork: reverse listen :\(Self.reverseListenPort) (+ probe \(h):\(p))")
+        startReverseNetworkSession(peerHint: h)
+
+        Task { [weak self] in
+            let reachable = await Self.tcpProbe(host: h, port: portNum, timeoutSeconds: 2.0)
+            guard reachable else {
+                Log.info("connectNetwork: \(h):\(p) still blocked — reverse path stays active")
+                return
+            }
+            await MainActor.run {
+                guard let self else { return }
+                Log.info("connectNetwork: \(h):\(p) reachable — switching to direct dial")
+                if let existing = self.session(for: ConnectionTarget.usb(udid: nil).sessionID) {
+                    self.end(existing)
+                }
+                self.connect(to: .usb(udid: nil), userInitiated: true)
+            }
+        }
+    }
+
+    /// Quick non-blocking TCP connect test (does not speak the protocol).
+    private static func tcpProbe(host: String, port: UInt16, timeoutSeconds: Double) async -> Bool {
+        await withCheckedContinuation { cont in
+            let queue = DispatchQueue(label: "opendisplay.tcp-probe")
+            let conn = NWConnection(
+                host: NWEndpoint.Host(host),
+                port: NWEndpoint.Port(rawValue: port)!,
+                using: .tcp)
+            var settled = false
+            let finish: (Bool) -> Void = { ok in
+                guard !settled else { return }
+                settled = true
+                conn.cancel()
+                cont.resume(returning: ok)
+            }
+            conn.stateUpdateHandler = { state in
+                switch state {
+                case .ready: finish(true)
+                case .failed, .cancelled: finish(false)
+                default: break
+                }
+            }
+            conn.start(queue: queue)
+            queue.asyncAfter(deadline: .now() + timeoutSeconds) { finish(false) }
+        }
+    }
+
+    /// Consumed by `connect(.usb(nil))` for tether / reverse network paths.
+    private var pendingManualTransport: SenderTransport?
+
+    /// Manual network session over an explicit host:port (optional source bind).
+    private func startManualTCPSession(host: String, port: UInt16, localHost: String?, name: String) {
+        let endpoint = NWEndpoint.hostPort(
+            host: NWEndpoint.Host(host),
+            port: NWEndpoint.Port(rawValue: port)!)
+        pendingManualTransport = .tcp(endpoint, localHost: localHost)
+        connect(to: .usb(udid: nil), userInitiated: true)
+        _ = name // label comes from ConnectionTarget; host is in UserDefaults
+    }
+
+    /// Mac listens; tablet discovers via Bonjour and dials in (AP isolation workaround).
+    private func startReverseNetworkSession(peerHint: String) {
+        pendingManualTransport = .reverseListen(port: Self.reverseListenPort)
+        Log.info("startReverseNetworkSession for peer \(peerHint)")
+        connect(to: .usb(udid: nil), userInitiated: true)
     }
 
     func connect(to target: ConnectionTarget, userInitiated: Bool = false,
@@ -708,15 +1118,22 @@ final class SenderController: ObservableObject {
         // Connecting a device clears its "don't auto-connect" state.
         switch target {
         case .usb: usbDisabled.remove(id)
-        case .wifi: wifiRemembered.insert(id)
-        case .androidUsb: break
+        case .wifi:
+            wifiRemembered.insert(id)
+            wifiDisabled.remove(id)
+        case .androidUsb:
+            usbDisabled.remove(id)
         }
 
         let transport: SenderTransport
         switch target {
         case .usb(let udid):
             guard let portNum = UInt16(port) else { return }
-            if UserDefaults.standard.object(forKey: "host") != nil, udid == nil {
+            if udid == nil, let pending = pendingManualTransport {
+                // Tether peer or reverse-listen (set by connectNetwork).
+                transport = pending
+                pendingManualTransport = nil
+            } else if UserDefaults.standard.object(forKey: "host") != nil, udid == nil {
                 // Manual override: dial a plain TCP endpoint instead of usbmuxd.
                 transport = .tcp(.hostPort(host: NWEndpoint.Host(host),
                                            port: NWEndpoint.Port(rawValue: portNum)!))
@@ -857,14 +1274,26 @@ final class SenderController: ObservableObject {
     /// User-initiated disconnect: also opt the device out of auto-connect.
     func disconnect(_ session: DeviceSession) {
         switch session.target {
-        case .usb: usbDisabled.insert(session.id)
-        case .wifi: wifiRemembered.remove(session.id)
-        case .androidUsb: usbDisabled.insert(session.id)
+        case .usb:
+            usbDisabled.insert(session.id)
+            // Manual network uses usb(nil).
+            if case .usb(let udid) = session.target, udid == nil {
+                let h = host.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !h.isEmpty { wifiDisabled.insert("network:\(h)") }
+            }
+        case .wifi:
+            wifiRemembered.remove(session.id)
+            wifiDisabled.insert(session.id)
+        case .androidUsb:
+            usbDisabled.insert(session.id)
         }
         // A migrated session is also reachable the other way — opt that side
         // out too, or auto-connect resurrects the device moments later.
         if session.onUSB, let udid = session.usbUDID { usbDisabled.insert("usb:\(udid)") }
-        if let name = session.wifiServiceName { wifiRemembered.remove("wifi:\(name)") }
+        if let name = session.wifiServiceName {
+            wifiRemembered.remove("wifi:\(name)")
+            wifiDisabled.insert("wifi:\(name)")
+        }
         end(session)
     }
 
@@ -955,7 +1384,7 @@ final class SenderController: ObservableObject {
             coveredSessionIDs.insert(target.sessionID)
             let name = androidUsbAvailable
                 ? androidUsbLabel
-                : "Android USB (plug in · enable tether or USB debugging)"
+                : "Android USB"
             entries.append(DeviceEntry(
                 id: target.sessionID,
                 name: name,
@@ -984,7 +1413,10 @@ final class SenderController: ObservableObject {
                 usbTarget: usbTarget,
                 wifiTarget: twin.map { .wifi($0) }))
         }
-        if UserDefaults.standard.object(forKey: "host") != nil {
+        // Manual network (IP:port) — always show a row once the user has set a host,
+        // including while connected so Disconnect/Retry stay available.
+        if !host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || UserDefaults.standard.object(forKey: "host") != nil {
             let target = ConnectionTarget.usb(udid: nil)
             coveredSessionIDs.insert(target.sessionID)
             entries.append(DeviceEntry(id: target.sessionID, name: label(for: target),
@@ -1161,42 +1593,149 @@ struct ContentView: View {
             Form {
                 Section("Devices") {
                     if controller.deviceEntries.isEmpty {
-                        Text("No devices found — same Wi‑Fi + OpenDisplay on the tablet, or USB: enable USB debugging (adb) or USB tethering (Mac needs a tether IP; charge-only / accessory mode will not work).")
+                        Text("No devices found yet.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
                     ForEach(controller.deviceEntries) { entry in
                         if let session = controller.session(for: entry) {
-                            // Title from the entry, not the session: the
-                            // session name was snapshotted at connect time,
-                            // often before lockdown resolved the real name.
                             SessionRow(title: entry.name, session: session,
                                        controller: controller)
                         } else {
-                            HStack(alignment: .firstTextBaseline) {
-                                Circle()
-                                    .fill(.secondary.opacity(0.5))
-                                    .frame(width: 9, height: 9)
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(entry.name)
-                                    Text(entry.transportLabel)
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-                                Spacer()
-                                if let target = entry.preferredTarget {
-                                    Button {
-                                        controller.connect(to: target, userInitiated: true)
-                                    } label: {
-                                        Label("Connect", systemImage: "link")
-                                    }
-                                    .controlSize(.regular)
-                                    .buttonStyle(.borderedProminent)
-                                    .help("Start streaming to this device")
+                            DeviceIdleRow(entry: entry) {
+                                if let wifi = entry.wifiTarget, case .wifi(let result) = wifi {
+                                    controller.connectVerifiedBonjour(
+                                        name: entry.name, result: result, userInitiated: true)
+                                } else if let target = entry.preferredTarget {
+                                    controller.connect(to: target, userInitiated: true)
                                 }
                             }
                         }
                     }
+                }
+
+                Section("Connect over network") {
+                    HStack(alignment: .center, spacing: 8) {
+                        if controller.discovered.isEmpty && controller.lanHits.isEmpty {
+                            ProgressView()
+                                .controlSize(.small)
+                        } else if !controller.lanHits.isEmpty || !controller.discovered.isEmpty {
+                            Image(systemName: "checkmark.seal.fill")
+                                .foregroundStyle(.green)
+                                .font(.caption)
+                        } else {
+                            Image(systemName: "wifi")
+                                .foregroundStyle(.secondary)
+                                .font(.caption)
+                        }
+                        Text(controller.discoveryStatus)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(3)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        Button("Rescan") {
+                            controller.rescanNetwork()
+                        }
+                        .controlSize(.small)
+                    }
+
+                    Toggle("Auto-connect when found", isOn: $controller.networkAutoConnect)
+                        .toggleStyle(.switch)
+
+                    // Verified receivers fill the IP field when tapped — only one Connect button below.
+                    ForEach(controller.lanHits) { hit in
+                        Button {
+                            controller.host = hit.host
+                            controller.port = SenderController.plainPortString(hit.port)
+                        } label: {
+                            HStack(alignment: .center, spacing: 10) {
+                                Image(systemName: "checkmark.seal.fill")
+                                    .foregroundStyle(.green)
+                                    .frame(width: 16)
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text(hit.name)
+                                        .font(.body.weight(.medium))
+                                        .lineLimit(1)
+                                    // verbatim: SwiftUI Text("…\(port)…") uses LocalizedStringKey
+                                    // and can render 9'000 under Swiss/EU locales.
+                                    Text(verbatim: "\(hit.host):\(hit.port) · UDP verified")
+                                        .font(.caption.monospaced())
+                                        .foregroundStyle(.secondary)
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    ForEach(controller.bonjourVerifiedEntries, id: \.id) { entry in
+                        Button {
+                            if let host = entry.host {
+                                controller.host = host
+                                controller.port = SenderController.plainPortString(entry.port)
+                            }
+                        } label: {
+                            HStack(alignment: .center, spacing: 10) {
+                                Image(systemName: "checkmark.seal.fill")
+                                    .foregroundStyle(.green)
+                                    .frame(width: 16)
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text(entry.name)
+                                        .font(.body.weight(.medium))
+                                        .lineLimit(1)
+                                    Group {
+                                        if let host = entry.host {
+                                            Text(verbatim: "\(host):\(entry.port) · Bonjour verified")
+                                                .font(.caption.monospaced())
+                                        } else {
+                                            Text("Resolving IP… · Bonjour verified")
+                                                .font(.caption)
+                                        }
+                                    }
+                                    .foregroundStyle(.secondary)
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(entry.host == nil)
+                    }
+
+                    Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 8) {
+                        GridRow {
+                            Text("IP")
+                                .foregroundStyle(.secondary)
+                                .frame(width: 36, alignment: .trailing)
+                            TextField("192.168.0.20", text: $controller.host)
+                                .textFieldStyle(.roundedBorder)
+                                .font(.body.monospaced())
+                        }
+                        GridRow {
+                            Text("Port")
+                                .foregroundStyle(.secondary)
+                                .frame(width: 36, alignment: .trailing)
+                            TextField("9000", text: $controller.port)
+                                .textFieldStyle(.roundedBorder)
+                                .font(.body.monospaced())
+                                .frame(maxWidth: 100, alignment: .leading)
+                        }
+                    }
+
+                    Button {
+                        controller.connectNetwork()
+                    } label: {
+                        Label("Connect over network", systemImage: "wifi")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.large)
+                    .disabled({
+                        let h = controller.host.trimmingCharacters(in: .whitespacesAndNewlines)
+                        return h.isEmpty || UInt16(controller.port) == nil
+                    }())
+
+                    Text("Connect starts reverse mode: this Mac listens and the tablet dials back (works when the router blocks Mac→tablet TCP). Keep OpenDisplay open on the tablet.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
 
                 // Use buttons (not segmented pickers): more reliable click targets
@@ -1475,6 +2014,70 @@ struct CheckForUpdatesView: View {
     }
 }
 
+/// Idle (not yet connected) device row — name left, fixed-width Connect right.
+private struct DeviceIdleRow: View {
+    let entry: SenderController.DeviceEntry
+    let connect: () -> Void
+
+    private var isNetworkOnly: Bool {
+        entry.wifiTarget != nil && entry.usbTarget == nil && entry.androidUsbTarget == nil
+    }
+
+    private var isAndroidUsb: Bool {
+        entry.androidUsbTarget != nil
+    }
+
+    private var subtitle: String {
+        if isAndroidUsb {
+            return entry.name == "Android USB"
+                ? "Plug in · USB debugging or tether"
+                : entry.transportLabel
+        }
+        if isNetworkOnly {
+            return "Wi‑Fi · signature verified"
+        }
+        return entry.transportLabel
+    }
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 10) {
+            if isNetworkOnly {
+                Image(systemName: "checkmark.seal.fill")
+                    .foregroundStyle(.green)
+                    .font(.caption)
+                    .frame(width: 12)
+            } else {
+                Circle()
+                    .fill(Color.secondary.opacity(0.45))
+                    .frame(width: 9, height: 9)
+            }
+            VStack(alignment: .leading, spacing: 2) {
+                Text(entry.name)
+                    .font(.body.weight(.medium))
+                    .lineLimit(1)
+                Text(subtitle)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            Button(action: connect) {
+                Text(isAndroidUsb ? "USB" : (isNetworkOnly ? "Wi‑Fi" : "Connect"))
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
+            .frame(width: 88)
+            .help(isAndroidUsb
+                  ? "Connect over USB (adb) — most reliable"
+                  : (isNetworkOnly
+                     ? "Connect over the local network (uses USB if adb is available)"
+                     : "Start streaming to this device"))
+        }
+        .padding(.vertical, 2)
+    }
+}
+
 /// One connected device: live status, throughput, reconnect + disconnect.
 struct SessionRow: View {
     let title: String
@@ -1494,7 +2097,7 @@ struct SessionRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack(alignment: .firstTextBaseline) {
+            HStack(alignment: .center, spacing: 10) {
                 Circle()
                     .fill(statusColor)
                     .frame(width: 9, height: 9)
@@ -1507,7 +2110,7 @@ struct SessionRow: View {
                         .foregroundStyle(.secondary)
                         .lineLimit(2)
                 }
-                Spacer(minLength: 8)
+                .frame(maxWidth: .infinity, alignment: .leading)
                 if session.mbps > 0 {
                     Text("\(String(format: "%.1f", session.mbps)) Mbit/s")
                         .font(.system(.caption, design: .monospaced))
@@ -1515,45 +2118,34 @@ struct SessionRow: View {
                 }
             }
 
-            // Short labels that fit the panel width (no “Send W…” / “Discon…” truncation).
-            // Full wording is in tooltips.
+            // Equal-width action chips so columns line up across sessions.
             HStack(spacing: 6) {
                 if session.sender.canHostWindows {
-                    sessionChip(
-                        "Send",
-                        systemImage: "rectangle.portrait.and.arrow.right",
-                        help: "Move the frontmost app’s window onto this tablet. Focus that app first, then press Send. Needs Accessibility."
-                    ) {
+                    sessionChip("Send", systemImage: "rectangle.portrait.and.arrow.right",
+                                help: "Move the frontmost app’s window onto this tablet.") {
                         _ = session.sender.moveFrontWindowToDisplay()
                     }
-                    sessionChip(
-                        "Retrieve",
-                        systemImage: "rectangle.portrait.and.arrow.left",
-                        help: "Move windows from this tablet back onto the Mac. Needs Accessibility."
-                    ) {
+                    sessionChip("Retrieve", systemImage: "rectangle.portrait.and.arrow.left",
+                                help: "Move windows from this tablet back onto the Mac.") {
                         _ = session.sender.retrieveWindowsToMac()
                     }
                 }
-                sessionChip(
-                    "Retry",
-                    systemImage: "arrow.clockwise",
-                    help: "Drop the TCP link and reconnect (keeps the virtual display when possible)."
-                ) {
+                sessionChip("Retry", systemImage: "arrow.clockwise",
+                            help: "Drop the TCP link and reconnect.") {
                     session.sender.forceReconnect()
                 }
-
-                Spacer(minLength: 4)
-
+                Spacer(minLength: 0)
                 Button(role: .destructive) {
                     controller.disconnect(session)
                 } label: {
                     Text("Stop")
-                        .frame(minWidth: 44)
+                        .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
                 .tint(.red)
                 .controlSize(.small)
-                .help("Stop streaming to this device and free its virtual display")
+                .frame(width: 72)
+                .help("Stop streaming to this device")
             }
         }
         .padding(.vertical, 2)
@@ -1566,10 +2158,11 @@ struct SessionRow: View {
             Label(title, systemImage: systemImage)
                 .labelStyle(.titleAndIcon)
                 .lineLimit(1)
-                .fixedSize(horizontal: true, vertical: false)
+                .frame(maxWidth: .infinity)
         }
         .buttonStyle(.bordered)
         .controlSize(.small)
+        .frame(minWidth: 72)
         .help(help)
     }
 }

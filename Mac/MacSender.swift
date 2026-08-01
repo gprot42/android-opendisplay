@@ -18,6 +18,8 @@ import VideoToolbox
 import Network
 import CoreMedia
 import AppKit
+import Darwin
+import Foundation
 
 enum CaptureMode: String {
     case mirror   // main display (Milestone 1)
@@ -122,6 +124,9 @@ enum SenderTransport {
     /// reconfigures or roams onto Wi‑Fi).
     case tcp(NWEndpoint, localHost: String? = nil)
     case usb(udid: String?, port: UInt16)  // native usbmuxd dial; nil = first device
+    /// Wait for the tablet to dial us (AP isolation often blocks Mac→tablet TCP
+    /// while still allowing tablet→Mac). Advertises `_opendisplay-mac._tcp`.
+    case reverseListen(port: UInt16)
 }
 
 @available(macOS 14.0, *)
@@ -149,6 +154,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private var stream: SCStream?
     private var encoder: VTCompressionSession?
     private var connection: NWConnection?
+    private var reverseListener: NWListener?
+    /// Separate from NWListener.service so TCP accept keeps working if Bonjour flops.
+    private var reverseBonjour: NetService?
     private var virtualDisplay: VirtualDisplay?
     private let queue = DispatchQueue(label: "sender.video")
     private let audioQueue = DispatchQueue(label: "sender.audio")
@@ -259,6 +267,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // before giving up (still capped by disconnectGraceSeconds).
     private var consecutiveRefusals = 0
     private let refusalsBeforeGivingUp = 20
+    /// Consecutive dial deadlines without `.ready` (Wi‑Fi AP isolation etc.).
+    private var consecutiveDialTimeouts = 0
     private var dropsTotal: Int { dropsEncTotal + dropsNetTotal }
 
     // Local cursor echo: a cursor baked into the video carries the full
@@ -738,6 +748,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         inputInjector?.forceRelease()
         stream?.stopCapture { _ in }
         stream = nil
+        reverseBonjour?.stop()
+        reverseBonjour = nil
+        reverseListener?.cancel()
+        reverseListener = nil
         connection?.cancel()
         connection = nil
         if let encoder { VTCompressionSessionInvalidate(encoder) }
@@ -1016,7 +1030,185 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         switch transport {
         case .tcp(let endpoint, let localHost): connectTCP(endpoint, localHost: localHost)
         case .usb(let udid, let port): connectUSB(udid: udid, port: port)
+        case .reverseListen(let port): connectReverseListen(port: port)
         }
+    }
+
+    /// Tablet dials the Mac (works on APs that block Mac→tablet peer TCP).
+    /// TCP listen is independent of Bonjour advertise so NoAuth on mDNS does not
+    /// tear down the accept socket.
+    private func connectReverseListen(port: UInt16) {
+        dialGeneration += 1
+        let generation = dialGeneration
+        reverseBonjour?.stop()
+        reverseBonjour = nil
+        reverseListener?.cancel()
+        reverseListener = nil
+        if let previous = connection {
+            previous.stateUpdateHandler = nil
+            previous.cancel()
+        }
+        connection = nil
+        connectionReady = false
+
+        let tcp = NWProtocolTCP.Options()
+        tcp.noDelay = true
+        let params = NWParameters(tls: nil, tcp: tcp)
+        params.allowLocalEndpointReuse = true
+        params.includePeerToPeer = true
+
+        do {
+            // TCP-only first — do not attach NWListener.Service (Bonjour NoAuth
+            // was taking the whole listener down after .ready).
+            let listener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: port)!)
+            reverseListener = listener
+            var announcedReady = false
+            listener.stateUpdateHandler = { [weak self] state in
+                guard let self, generation == self.dialGeneration else { return }
+                switch state {
+                case .ready:
+                    if !announcedReady {
+                        announcedReady = true
+                        let ips = NetworkDiscovery.localIPv4Bases().isEmpty
+                            ? ""
+                            : " · Mac \(Self.localIPv4List().joined(separator: ", "))"
+                        Log.info("reverse listen ready on :\(port)\(ips)")
+                        Task {
+                            await self.status(
+                                "Waiting for tablet… open OpenDisplay on tablet (reverse :\(port))")
+                        }
+                        self.publishReverseBonjour(port: port)
+                        // If a tablet is on USB for debugging, tunnel reverse over adb
+                        // so tablet can dial 127.0.0.1:port when Wi‑Fi LAN is blocked.
+                        DispatchQueue.global(qos: .utility).async {
+                            if AndroidAdb.ensureReverse(devicePort: port, hostPort: port) {
+                                Log.info("reverse: adb reverse tcp:\(port) ready (tablet may dial 127.0.0.1)")
+                            }
+                        }
+                    }
+                case .failed(let error):
+                    Log.info("reverse listen failed: \(error)")
+                    Task {
+                        await self.status(
+                            "Listen failed on :\(port) — Local Network permission?")
+                    }
+                    // Back off; do not tight-loop.
+                    self.queue.asyncAfter(deadline: .now() + 3.0) { [weak self] in
+                        guard let self, generation == self.dialGeneration, !self.stopped else { return }
+                        self.connectReverseListen(port: port)
+                    }
+                case .waiting(let error):
+                    Log.info("reverse listen waiting: \(error)")
+                default:
+                    break
+                }
+            }
+            listener.newConnectionHandler = { [weak self] conn in
+                guard let self, generation == self.dialGeneration, !self.stopped else {
+                    conn.cancel()
+                    return
+                }
+                Log.info("reverse accept from tablet")
+                if let old = self.connection {
+                    old.stateUpdateHandler = nil
+                    old.cancel()
+                }
+                self.connection = conn
+                conn.stateUpdateHandler = { [weak self] state in
+                    guard let self, self.connection === conn else { return }
+                    switch state {
+                    case .ready:
+                        self.becomeReady(conn)
+                    case .failed(let error):
+                        Log.info("reverse peer failed: \(error)")
+                        self.connectionReady = false
+                        // Keep listening for a new dial — do not tear down the listener.
+                        self.connection = nil
+                        Task {
+                            await self.status(
+                                "Tablet disconnected — waiting for reconnect…")
+                        }
+                    case .cancelled:
+                        if self.connection === conn {
+                            self.connectionReady = false
+                            self.connection = nil
+                        }
+                    default:
+                        break
+                    }
+                }
+                conn.start(queue: self.queue)
+            }
+            listener.start(queue: queue)
+            Task {
+                await self.status("Wi‑Fi reverse: listening on :\(port)…")
+            }
+        } catch {
+            Log.info("reverse listen create failed: \(error)")
+            Task {
+                await self.status("Cannot listen on :\(port) — \(error.localizedDescription)")
+            }
+            queue.asyncAfter(deadline: .now() + 3.0) { [weak self] in
+                guard let self, generation == self.dialGeneration, !self.stopped else { return }
+                self.connectReverseListen(port: port)
+            }
+        }
+    }
+
+    private func publishReverseBonjour(port: UInt16) {
+        reverseBonjour?.stop()
+        // Bonjour instance names: avoid apostrophes / unicode that break some resolvers.
+        let rawName = Host.current().localizedName ?? "Mac"
+        let safe = rawName
+            .replacingOccurrences(of: "'", with: "")
+            .replacingOccurrences(of: "’", with: "")
+            .replacingOccurrences(of: " ", with: "-")
+        let instance = String(("OpenDisplay-\(safe)").prefix(63))
+        // NetService type needs trailing dots.
+        let svc = NetService(
+            domain: "local.",
+            type: "_opendisplay-mac._tcp.",
+            name: instance,
+            port: Int32(port))
+        svc.includesPeerToPeer = true
+        // TXT: sig + local IPv4 so the tablet has a hint even if resolve is flaky.
+        var txt: [String: Data] = [
+            "sig": Data("OpenDisplay".utf8),
+            "pv": Data("3".utf8),
+            "role": Data("host".utf8),
+        ]
+        let ips = Self.localIPv4List()
+        if let first = ips.first {
+            txt["ip"] = Data(first.utf8)
+        }
+        svc.setTXTRecord(NetService.data(fromTXTRecord: txt))
+        svc.publish()
+        reverseBonjour = svc
+        Log.info("reverse Bonjour published \(svc.name) type=_opendisplay-mac._tcp port=\(port) ips=\(ips.joined(separator: ","))")
+    }
+
+    private static func localIPv4List() -> [String] {
+        var out: [String] = []
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddr) == 0, let first = ifaddr else { return [] }
+        defer { freeifaddrs(ifaddr) }
+        var ptr: UnsafeMutablePointer<ifaddrs>? = first
+        while let p = ptr {
+            defer { ptr = p.pointee.ifa_next }
+            let flags = Int32(p.pointee.ifa_flags)
+            guard flags & IFF_UP != 0, flags & IFF_LOOPBACK == 0 else { continue }
+            guard let addr = p.pointee.ifa_addr, addr.pointee.sa_family == UInt8(AF_INET) else { continue }
+            let ifName = String(cString: p.pointee.ifa_name)
+            guard ifName.hasPrefix("en") else { continue }
+            var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            let len = socklen_t(MemoryLayout<sockaddr_in>.size)
+            guard getnameinfo(addr, len, &hostname, socklen_t(hostname.count),
+                              nil, 0, NI_NUMERICHOST) == 0 else { continue }
+            let ip = String(cString: hostname)
+            if ip.hasPrefix("169.254.") { continue }
+            out.append(ip)
+        }
+        return out
     }
 
     /// Bookkeeping shared by both transports once a connection is live.
@@ -1034,6 +1226,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         everConnected = true
         awaitingWake = false
         consecutiveRefusals = 0
+        consecutiveDialTimeouts = 0
         disconnectedSince = nil
         needsKeyframe = true   // new peer needs SPS/PPS + IDR
         // A reconnect can recreate the phone's video view with no cursor
@@ -1122,7 +1315,16 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         queue.asyncAfter(deadline: .now() + 12.0) { [weak self] in
             guard let self, generation == self.dialGeneration, !self.stopped,
                   self.connection === conn, conn.state != .ready else { return }
-            Log.info("dial timed out in \(conn.state) — redialing")
+            self.consecutiveDialTimeouts += 1
+            Log.info("dial timed out in \(conn.state) — redialing (n=\(self.consecutiveDialTimeouts))")
+            // Peer Wi‑Fi TCP often blocked by AP client isolation while mDNS
+            // still works — after a couple of hangs, tell the user clearly.
+            if self.consecutiveDialTimeouts >= 2, !self.isLoopbackTransport {
+                Task {
+                    await self.status(
+                        "Wi‑Fi TCP unreachable — AP may block peer traffic (client isolation)")
+                }
+            }
             self.scheduleReconnect()
         }
         conn.stateUpdateHandler = { [weak self] state in
@@ -1267,15 +1469,20 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
+    private var isLoopbackTransport: Bool {
+        guard case .tcp(let endpoint, _) = transport else { return false }
+        guard case .hostPort(let host, _) = endpoint else { return false }
+        let hostStr = "\(host)"
+        return hostStr == "127.0.0.1" || hostStr == "localhost" || hostStr == "::1"
+    }
+
     /// If this session dials via adb port-forward (127.0.0.1), ensure the
     /// forward still exists before the next connect().
     private func refreshAndroidAdbForwardIfNeeded() {
         guard case .tcp(let endpoint, _) = transport else { return }
         // hostPort form: loopback Android USB path.
         guard case .hostPort(let host, let port) = endpoint else { return }
-        let hostStr = "\(host)"
-        let isLoopback = hostStr == "127.0.0.1" || hostStr == "localhost" || hostStr == "::1"
-        guard isLoopback else { return }
+        guard isLoopbackTransport else { return }
         let devicePort = port.rawValue
         DispatchQueue.global(qos: .utility).async {
             if let p = AndroidAdb.ensureForward(devicePort: devicePort) {

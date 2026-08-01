@@ -11,8 +11,12 @@ object WireProtocol {
     const val ASSUMED_WHEN_ABSENT = 1
 
     const val DEFAULT_PORT: Int = 9000
+    /** Mac listens here when it cannot dial the tablet (AP client isolation). */
+    const val MAC_REVERSE_PORT: Int = 9011
     /** Android NsdManager requires the trailing period; Bonjour peers still match. */
     const val SERVICE_TYPE = "_opensidecar._tcp."
+    /** Mac host advertisement for reverse dial (tablet → Mac). */
+    const val MAC_HOST_SERVICE_TYPE = "_opendisplay-mac._tcp."
 }
 
 object WireMessage {
