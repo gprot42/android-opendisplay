@@ -20,83 +20,55 @@ enum AppPresentation: String, CaseIterable {
 @main
 struct OpenSidecarMacApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-    // Must be ObservedObject (not StateObject): SenderController is a shared
-    // singleton. StateObject assumes the view owns the object and can miss
-    // @Published updates from background polling — which left the menu bar
-    // stuck on "No devices found" even with USB tether up.
-    @ObservedObject private var controller = SenderController.shared
 
     var body: some Scene {
-        MenuBarExtra(isInserted: Binding(
-            get: { controller.presentation == .menuBar },
-            set: { _ in }
-        )) {
-            ContentView(controller: controller, updater: appDelegate.updater)
-        } label: {
-            Image(systemName: controller.running
-                  ? "rectangle.on.rectangle.fill" : "rectangle.on.rectangle")
+        // Required Scene for SwiftUI App lifecycle. Real UI is the AppKit
+        // NSStatusItem menu (StatusItemController) — SwiftUI MenuBarExtra
+        // rebuilt empty/unusable while streaming status published every second.
+        Settings {
+            EmptyView()
         }
-        .menuBarExtraStyle(.window)
     }
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    // Sparkle's standard updater. `startingUpdater: true` boots the updater
-    // immediately so scheduled background checks (SUEnableAutomaticChecks)
-    // run; the menu item drives manual "Check for Updates…". Held for the
-    // app's lifetime here so every window (menu bar + control window) shares
-    // one updater instance.
+    /// Local/dev builds ship `MARKETING_VERSION` 0.0.0 (see project.yml).
+    /// Those must not poll the public OpenDisplay appcast — Sparkle would
+    /// offer upstream 1.x and replace this Android-fork build.
+    private static var isLocalDevBuild: Bool {
+        let v = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+            ?? "0.0.0"
+        return v == "0.0.0"
+    }
+
+    // Sparkle only for non-dev builds. `startingUpdater: false` for 0.0.0 so
+    // we never auto-prompt "1.14.0 available — you have 0.0.0".
     let updater = SPUStandardUpdaterController(
-        startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
+        startingUpdater: !AppDelegate.isLocalDevBuild,
+        updaterDelegate: nil,
+        userDriverDelegate: nil
+    )
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Hand the updater to the control window, which is built outside the
-        // SwiftUI App scene (NSHostingView), so it can offer the same button.
-        MainWindow.updater = updater
-        // Force singleton init (starts Android USB polling + Bonjour) even if
-        // the MenuBarExtra body has not been evaluated yet.
+        // Menu-bar agent only — no Dock icon, no floating settings window.
         _ = SenderController.shared
-        let presentation = SenderController.shared.presentation
-        NSApp.setActivationPolicy(presentation == .dock ? .regular : .accessory)
-        if presentation != .menuBar {
-            MainWindow.show()
+        SenderController.shared.presentation = .menuBar
+        NSApp.setActivationPolicy(.accessory)
+
+        if Self.isLocalDevBuild {
+            updater.updater.automaticallyChecksForUpdates = false
+            Log.info("Sparkle: disabled (local build 0.0.0 — ignore upstream appcast)")
         }
-        Log.info("OpenDisplay launched (presentation=\(presentation.rawValue))")
+
+        StatusItemController.shared.install(updater: updater)
+        Log.info("OpenDisplay launched (menu bar → box panel)")
     }
 
-    // Background/Dock modes: opening the app again (Spotlight, Finder, Dock
-    // click) brings up the control window — Hammerspoon-style.
+    // Spotlight / Finder re-open: show the control panel again.
     func applicationShouldHandleReopen(_ sender: NSApplication,
                                        hasVisibleWindows: Bool) -> Bool {
-        MainWindow.show()
+        StatusItemController.shared.showPanel()
         return false
-    }
-}
-
-/// The control panel as a regular window, for Dock/background presentation.
-@MainActor
-enum MainWindow {
-    private static var window: NSWindow?
-    // Set once at launch by AppDelegate so the control window can share the
-    // app's single Sparkle updater.
-    static var updater: SPUStandardUpdaterController?
-
-    static func show() {
-        if window == nil {
-            let w = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 440, height: 540),
-                styleMask: [.titled, .closable, .miniaturizable],
-                backing: .buffered, defer: false)
-            w.title = "OpenDisplay (Android)"
-            w.contentView = NSHostingView(
-                rootView: ContentView(controller: SenderController.shared,
-                                      updater: updater))
-            w.isReleasedWhenClosed = false
-            w.center()
-            window = w
-        }
-        window?.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
     }
 }
 
@@ -186,10 +158,8 @@ final class SenderController: ObservableObject {
         rawValue: UserDefaults.standard.string(forKey: "presentation") ?? "") ?? .menuBar {
         didSet {
             UserDefaults.standard.set(presentation.rawValue, forKey: "presentation")
+            // Menu-bar agent by default — only Dock mode shows a Dock icon.
             NSApp.setActivationPolicy(presentation == .dock ? .regular : .accessory)
-            // Never strand the user without UI: leaving menu-bar mode opens
-            // the window immediately.
-            if presentation != .menuBar { MainWindow.show() }
         }
     }
 
@@ -314,14 +284,34 @@ final class SenderController: ObservableObject {
                 self.bringActivatedAppBackIfNeeded(note)
             }
         }
-        // Typing / clicking on the Mac should free a stuck tablet mouse capture.
-        NSEvent.addGlobalMonitorForEvents(matching: [.keyDown, .leftMouseDown, .rightMouseDown]) { [weak self] _ in
+        // Prefer Mac control over tablet injection for a short window when
+        // the user types or moves the trackpad — without posting synthetic
+        // mouse-ups that cancel clicks in our own menu.
+        var lastNote = Date.distantPast
+        NSEvent.addGlobalMonitorForEvents(matching: [.keyDown, .mouseMoved]) { [weak self] _ in
             guard let self else { return }
+            let now = Date()
+            guard now.timeIntervalSince(lastNote) > 0.2 else { return }
+            lastNote = now
+            InputInjector.noteMacControl(seconds: 1.5)
             Task { @MainActor in
-                guard self.sessions.contains(where: { $0.sender.canHostWindows }) else { return }
-                for session in self.sessions {
+                for session in self.sessions where session.sender.hasInjectedPointerCapture {
                     session.sender.releaseInjectedPointer()
                 }
+            }
+        }
+    }
+
+    /// Pause/resume tablet mouse injection while the control panel is open.
+    func setControlPanelOpen(_ open: Bool) {
+        InputInjector.injectionPaused = open
+        if open {
+            // Long window so tablet touches stay inert while the panel is up.
+            InputInjector.noteMacControl(seconds: 600)
+            // Clear capture state without synthesizing mouse-up (that cancels
+            // real trackpad clicks on Mode / Audio / Quality buttons).
+            for session in sessions {
+                session.sender.releaseInjectedPointer(restoreCursor: false, postEvents: false)
             }
         }
     }
@@ -393,7 +383,11 @@ final class SenderController: ObservableObject {
                 let adbName = AndroidAdb.displayName()
                 let tether = AndroidTether.isLikelyPresent()
                 let tetherLabel = AndroidTether.displayName()
-                let cable = AndroidUsbCable.primary()
+                // Skip ioreg when adb/tether already prove a device is present —
+                // full USB tree dumps were a major hitch source.
+                let cable: AndroidUsbCable.Device? = (serials.isEmpty && !tether)
+                    ? AndroidUsbCable.primary()
+                    : nil
 
                 let available = tether || !serials.isEmpty || cable != nil
                 let label: String = {
@@ -405,9 +399,14 @@ final class SenderController: ObservableObject {
 
                 await MainActor.run {
                     let wasAvailable = controller.androidUsbAvailable
-                    // Always assign so SwiftUI sees a change even when Bool stays true.
-                    controller.androidUsbAvailable = available
-                    controller.androidUsbLabel = label
+                    // Only publish when values change — force-assigning every
+                    // 2s rebuilt the settings Form and killed picker clicks.
+                    if controller.androidUsbAvailable != available {
+                        controller.androidUsbAvailable = available
+                    }
+                    if controller.androidUsbLabel != label {
+                        controller.androidUsbLabel = label
+                    }
                     Log.info("Android USB poll: available=\(available) label=\(label) tether=\(tether) adb=\(serials.count) cable=\(cable?.name ?? "nil")")
                     // Cable / adb appeared or session missing: try auto-connect.
                     if available, !androidSession {
@@ -767,7 +766,10 @@ final class SenderController: ObservableObject {
             session.wifiServiceName = serviceName(of: result)
         }
         sender.onStatus = { [weak session] text in
-            session?.status = text
+            guard let session else { return }
+            if session.status != text {
+                session.status = text
+            }
             Log.info("status[\(id)]: \(text)")
         }
         sender.onHello = { [weak self, weak session] info in
@@ -783,8 +785,12 @@ final class SenderController: ObservableObject {
             self.autoConnect()
         }
         sender.onStats = { [weak session] frames, mbps in
-            session?.framesSent = frames
-            session?.mbps = mbps
+            // Throttle UI: sub-Mbps flicker was redrawing SessionRow every second.
+            guard let session else { return }
+            session.framesSent = frames
+            if abs(session.mbps - mbps) >= 0.15 {
+                session.mbps = mbps
+            }
         }
         sender.onDisconnected = { [weak self, weak session] in
             // Device unplugged / left the network and stayed gone: end this
@@ -870,6 +876,20 @@ final class SenderController: ObservableObject {
         }
         targets.forEach { connect(to: $0) }
         autoConnect()   // a rebuilt WiFi session may deserve its cable back
+    }
+
+    private var restartWorkItem: DispatchWorkItem?
+
+    /// Debounced restart so menu picks feel instant: the menu closes right
+    /// away; the (slow) stream rebuild runs ~0.35s later and coalesces rapid
+    /// option flips into a single reconnect.
+    func scheduleRestartAll() {
+        restartWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.restartAll()
+        }
+        restartWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: work)
     }
 
     // MARK: - Device list (one row per physical device)
@@ -1124,6 +1144,7 @@ struct ContentView: View {
             Divider()
 
             // Settings
+            ScrollView {
             Form {
                 Section("Devices") {
                     if controller.deviceEntries.isEmpty {
@@ -1165,22 +1186,36 @@ struct ContentView: View {
                     }
                 }
 
-                Picker("Mode", selection: $controller.mode) {
-                    Text("Extend").tag(CaptureMode.extend)
-                    Text("Mirror").tag(CaptureMode.mirror)
+                // Use buttons (not segmented pickers): more reliable click targets
+                // in NSHostingView while a stream is running.
+                LabeledContent("Mode") {
+                    HStack(spacing: 8) {
+                        settingButton("Extend", selected: controller.mode == .extend) {
+                            guard controller.mode != .extend else { return }
+                            controller.mode = .extend
+                            controller.scheduleRestartAll()
+                        }
+                        settingButton("Mirror", selected: controller.mode == .mirror) {
+                            guard controller.mode != .mirror else { return }
+                            controller.mode = .mirror
+                            controller.scheduleRestartAll()
+                        }
+                    }
                 }
-                .pickerStyle(.segmented)
-                .onChange(of: controller.mode) { controller.restartAll() }
 
                 if controller.mode == .extend {
                     VStack(alignment: .leading, spacing: 4) {
-                        Picker("Screen position", selection: $controller.displaySide) {
-                            ForEach(DisplaySide.allCases, id: \.self) { side in
-                                Text(side.shortLabel).tag(side)
+                        LabeledContent("Screen position") {
+                            HStack(spacing: 8) {
+                                ForEach(DisplaySide.allCases, id: \.self) { side in
+                                    settingButton(side.shortLabel, selected: controller.displaySide == side) {
+                                        guard controller.displaySide != side else { return }
+                                        controller.displaySide = side
+                                        controller.scheduleRestartAll()
+                                    }
+                                }
                             }
                         }
-                        .pickerStyle(.segmented)
-                        .onChange(of: controller.displaySide) { controller.restartAll() }
                         Text(controller.displaySide == .left
                              ? "Tablet sits left of the Mac — move the mouse left to reach it."
                              : "Tablet sits right of the Mac — move the mouse right to reach it.")
@@ -1203,34 +1238,47 @@ struct ContentView: View {
                 }
 
                 VStack(alignment: .leading, spacing: 4) {
-                    Picker("Quality", selection: $controller.quality) {
-                        ForEach(StreamQuality.allCases, id: \.self) { q in
-                            Text(q.label).tag(q)
+                    LabeledContent("Quality") {
+                        HStack(spacing: 8) {
+                            ForEach(StreamQuality.allCases, id: \.self) { q in
+                                settingButton(shortQuality(q), selected: controller.quality == q) {
+                                    guard controller.quality != q else { return }
+                                    controller.quality = q
+                                    controller.scheduleRestartAll()
+                                }
+                            }
                         }
                     }
-                    .onChange(of: controller.quality) { controller.restartAll() }
                     Text(controller.quality.explanation)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
 
                 VStack(alignment: .leading, spacing: 4) {
-                    Picker("Play audio on", selection: $controller.audioOutput) {
-                        ForEach(AudioOutput.allCases, id: \.self) { out in
-                            Text(out.label).tag(out)
+                    LabeledContent("Play audio on") {
+                        HStack(spacing: 8) {
+                            ForEach(AudioOutput.allCases, id: \.self) { out in
+                                settingButton(out.label, selected: controller.audioOutput == out) {
+                                    guard controller.audioOutput != out else { return }
+                                    controller.audioOutput = out
+                                    controller.scheduleRestartAll()
+                                }
+                            }
                         }
                     }
-                    .pickerStyle(.segmented)
-                    .onChange(of: controller.audioOutput) { controller.restartAll() }
                     Text(controller.audioOutput.explanation)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
 
                 VStack(alignment: .leading, spacing: 4) {
-                    Picker("Show app in", selection: $controller.presentation) {
-                        ForEach(AppPresentation.allCases, id: \.self) { p in
-                            Text(p.label).tag(p)
+                    LabeledContent("Show app in") {
+                        HStack(spacing: 8) {
+                            ForEach(AppPresentation.allCases, id: \.self) { p in
+                                settingButton(p.label, selected: controller.presentation == p) {
+                                    controller.presentation = p
+                                }
+                            }
                         }
                     }
                     if controller.presentation == .background {
@@ -1277,9 +1325,9 @@ struct ContentView: View {
                 }
             }
             .formStyle(.grouped)
-            // Scrollable + fixed panel height: MenuBarExtra windows mis-measure
-            // grouped Forms (clipping on small displays), so size explicitly
-            // and let the form scroll when it doesn't fit.
+            .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            // Fixed panel height for MenuBarExtra; form scrolls when content is tall.
 
             Divider()
 
@@ -1294,7 +1342,9 @@ struct ContentView: View {
                     .font(.callout)
                     .lineLimit(1)
                 Spacer()
-                if let updater {
+                // Local 0.0.0 builds must not offer Sparkle “update” to upstream.
+                if let updater,
+                   (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) != "0.0.0" {
                     CheckForUpdatesView(updater: updater)
                 }
                 Button("Quit") { NSApp.terminate(nil) }
@@ -1303,7 +1353,41 @@ struct ContentView: View {
             .padding(.horizontal, 16)
             .padding(.vertical, 10)
         }
-        .frame(width: 440, height: 540)
+        .frame(width: 440, height: 560)
+        // Injection pause is owned by StatusItemController (panel open/close).
+        // Do NOT toggle it from onAppear/onDisappear — SwiftUI rebuilds this
+        // view on status ticks and would re-enable tablet input mid-click.
+    }
+
+    private func shortQuality(_ q: StreamQuality) -> String {
+        switch q {
+        case .best: return "Best"
+        case .balanced: return "Balanced"
+        case .fast: return "Fast"
+        }
+    }
+
+    @ViewBuilder
+    private func settingButton(_ title: String, selected: Bool, action: @escaping () -> Void) -> some View {
+        // Selected = filled blue (prominent); unselected = outline.
+        if selected {
+            Button(action: action) {
+                Text(title)
+                    .fontWeight(.semibold)
+                    .frame(minWidth: 64)
+                    .padding(.horizontal, 4)
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.regular)
+        } else {
+            Button(action: action) {
+                Text(title)
+                    .frame(minWidth: 64)
+                    .padding(.horizontal, 4)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.regular)
+        }
     }
 
     @ViewBuilder
@@ -1386,7 +1470,7 @@ struct SessionRow: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .firstTextBaseline) {
                 Circle()
                     .fill(statusColor)
@@ -1394,6 +1478,7 @@ struct SessionRow: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(title)
                         .font(.body.weight(.medium))
+                        .lineLimit(1)
                     Text("\(session.transportLabel) · \(session.status)")
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -1407,47 +1492,61 @@ struct SessionRow: View {
                 }
             }
 
-            HStack(spacing: 8) {
+            // Short labels that fit the panel width (no “Send W…” / “Discon…” truncation).
+            // Full wording is in tooltips.
+            HStack(spacing: 6) {
                 if session.sender.canHostWindows {
-                    Button {
-                        // Focus another app first; this moves that app's front window.
+                    sessionChip(
+                        "Send",
+                        systemImage: "rectangle.portrait.and.arrow.right",
+                        help: "Move the frontmost app’s window onto this tablet. Focus that app first, then press Send. Needs Accessibility."
+                    ) {
                         _ = session.sender.moveFrontWindowToDisplay()
-                    } label: {
-                        Label("Send Window", systemImage: "rectangle.portrait.and.arrow.right")
                     }
-                    .controlSize(.small)
-                    .help("Move the frontmost app’s window onto this device. Click the app first (not OpenDisplay), then press Send Window. Needs Accessibility permission.")
-
-                    Button {
+                    sessionChip(
+                        "Retrieve",
+                        systemImage: "rectangle.portrait.and.arrow.left",
+                        help: "Move windows from this tablet back onto the Mac. Needs Accessibility."
+                    ) {
                         _ = session.sender.retrieveWindowsToMac()
-                    } label: {
-                        Label("Retrieve", systemImage: "rectangle.portrait.and.arrow.left")
                     }
-                    .controlSize(.small)
-                    .help("Move windows from this device (or stuck off-screen) back onto your Mac display. Also: click the app in the Dock while the pointer is on the Mac. Needs Accessibility permission.")
                 }
-
-                Button {
+                sessionChip(
+                    "Retry",
+                    systemImage: "arrow.clockwise",
+                    help: "Drop the TCP link and reconnect (keeps the virtual display when possible)."
+                ) {
                     session.sender.forceReconnect()
-                } label: {
-                    Label("Reconnect", systemImage: "arrow.clockwise")
                 }
-                .controlSize(.small)
-                .help("Drop the TCP link and pair with this device again (keeps the virtual display when possible)")
 
-                Spacer(minLength: 0)
+                Spacer(minLength: 4)
 
                 Button(role: .destructive) {
                     controller.disconnect(session)
                 } label: {
-                    Label("Disconnect", systemImage: "xmark.circle.fill")
+                    Text("Stop")
+                        .frame(minWidth: 44)
                 }
-                .controlSize(.regular)
                 .buttonStyle(.bordered)
                 .tint(.red)
-                .help("Stop streaming to this device and remove its virtual display")
+                .controlSize(.small)
+                .help("Stop streaming to this device and free its virtual display")
             }
         }
         .padding(.vertical, 2)
+    }
+
+    @ViewBuilder
+    private func sessionChip(_ title: String, systemImage: String, help: String,
+                             action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Label(title, systemImage: systemImage)
+                .labelStyle(.titleAndIcon)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.small)
+        .help(help)
     }
 }

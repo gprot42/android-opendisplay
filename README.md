@@ -4,7 +4,8 @@
 
 # OpenDisplay (Android)
 
-**Android receiver only** — phone or tablet as a second Mac monitor over Wi‑Fi.
+**Android receiver only** — phone or tablet as a second Mac monitor
+over Wi‑Fi or USB.
 
 Mac + iPhone/iPad apps:
 
@@ -23,14 +24,35 @@ Mac + iPhone/iPad apps:
 
 ---
 
-Free, open source, no subscription — alternative to Sidecar / Duet / Luna on hardware you already own.
+Free, open source, no subscription — Sidecar / Duet / Luna alternative
+on hardware you already own.
 
 ## Features
 
-- True display extension (or mirror) via Mac OpenDisplay
-- **Network (Wi‑Fi) by default** · **USB via tethering** (no debugging) · optional adb fallback
-- Hardware H.264 decode · **system audio** · touch + two-finger scroll · pinch-to-zoom · cursor overlay
-- Portrait / landscape · mDNS discovery + manual IP · stays running in background
+**Display**
+
+- **Extend** — real second desktop (virtual Mac display)
+- **Mirror** — show the main Mac screen on the tablet
+- Retina-scale stream via hardware H.264
+- Works in portrait or landscape
+
+**Connect**
+
+- **Wi‑Fi** (default) — same network, mDNS discovery or manual `IP:9000`
+- **USB + adb** — preferred cable path; keeps Mac Wi‑Fi working
+- **USB tethering** — no debugging; may affect Mac internet routing
+
+**Input & audio**
+
+- Touch click, drag, and two-finger scroll
+- Pinch-to-zoom; Mac cursor overlay
+- System audio: **Play on Tablet** (default) or **This Mac**
+
+**Reliability**
+
+- Stays running in the background (foreground service)
+- Auto-reconnect for brief USB / stream blips
+- Retrieve windows back to the Mac in Extend mode
 
 ## What works
 
@@ -42,10 +64,10 @@ Free, open source, no subscription — alternative to Sidecar / Duet / Luna on h
 | Mac cursor overlay | ✅ |
 | mDNS (`_opensidecar._tcp`) | ✅ when LAN allows multicast |
 | Manual IP connect | ✅ |
-| **Network mode (default)** | ✅ Wi‑Fi / LAN |
-| **USB mode** | ✅ **USB tethering** (no debugging) · optional `adb` fallback |
-| System audio | ✅ **Play audio on** Tablet (default) or This Mac |
-| Background keep-alive | ✅ foreground service (session survives Home) |
+| Network mode (default) | ✅ Wi‑Fi / LAN |
+| USB mode | ✅ adb (preferred) · tether fallback |
+| System audio | ✅ Tablet or This Mac |
+| Background keep-alive | ✅ session survives Home |
 
 ## Android versions
 
@@ -54,34 +76,33 @@ Free, open source, no subscription — alternative to Sidecar / Duet / Luna on h
 | **8.0–9** | **26–28** | Supported | Higher latency; Mac quality **Fast** |
 | **10** | **29** | Supported | Same as above |
 | **11+** | **30+** | **Recommended** | Official low-latency decode |
-| **12** | **31–32** | Supported | Guest Wi‑Fi may block mDNS → use manual IP |
+| **12** | **31–32** | Supported | Guest Wi‑Fi may block mDNS |
 | **13** | **33** | Supported | `NEARBY_WIFI_DEVICES` for discovery |
-| **14** | **34** | Supported | Same as 11+ (low-latency path) |
-| **15** | **35** | Supported | **targetSdk**; same as 11+ |
-| **16** | **36** | Supported | Runs above targetSdk; verified on Pixel 10 Pro XL |
+| **14** | **34** | Supported | Same as 11+ |
+| **15** | **35** | Supported | **targetSdk** |
+| **16** | **36** | Supported | Verified on Pixel 10 Pro XL |
 
 | | |
 |---|---|
 | **minSdk** | Android **8.0** (API **26**) |
 | **targetSdk** | Android 15 (API 35) |
-| **Required** | Hardware H.264 / AVC decoder (normal devices have one) |
+| **Required** | Hardware H.264 / AVC decoder |
 
 | Device | Android | Result |
 |---|---|---|
-| Pixel 10 Pro XL | 16 / API 36 | Stream + touch + cursor (Wi‑Fi + USB via `adb forward`) |
-| **Google Pixel Tablet** (10.95″, 2560×1600) | 15 / API 35 | Stream + touch + cursor (Wi‑Fi + USB via `adb forward`) |
+| Pixel 10 Pro XL | 16 / API 36 | Stream + touch + cursor (Wi‑Fi + adb) |
+| **Google Pixel Tablet** (10.95″) | 15 / API 35 | Stream + touch + cursor (Wi‑Fi + adb) |
 
 More devices: PR welcome — model, Android version, pass/fail.
 
 ## Install & run
 
-**Mac:** [OpenDisplay.dmg](https://github.com/peetzweg/opendisplay/releases/latest) from the main project.
-
-Local install (build + sign + copy into `/Applications`):
+**Mac:** [OpenDisplay.dmg](https://github.com/peetzweg/opendisplay/releases/latest)
+from the main project, or build this fork:
 
 ```sh
-./install-mac.sh --open            # Debug → /Applications/OpenDisplay Dev.app
-./install-mac.sh --release --open  # Release → /Applications/OpenDisplay.app
+./install-mac.sh --open            # Debug → OpenDisplay Dev.app
+./install-mac.sh --release --open  # Release → OpenDisplay.app
 ```
 
 **Android:**
@@ -93,13 +114,20 @@ cd Android
 adb install -r ~/OpenDisplay-*-debug.apk
 ```
 
-Needs JDK 17+ and the Android SDK. Details: [`Android/README.md`](Android/README.md).
+Needs JDK 17+ and the Android SDK.
+Details: [`Android/README.md`](Android/README.md).
 
 1. Open the Android app.
-2. **Network (default):** same Wi‑Fi → Mac OpenDisplay → pick the device (or **IP:9000**).
-3. **USB (keeps Mac Wi‑Fi):** USB debugging + `adb` → app mode **USB** → Mac **Android USB**. Prefer this over tethering.
+2. **Network (default):** same Wi‑Fi → Mac OpenDisplay → pick the
+   device (or **IP:9000**).
+3. **USB (keeps Mac Wi‑Fi):** enable USB debugging + `adb` → app mode
+   **USB** → Mac **Android USB**. Prefer this over tethering.
 
-   **USB without debugging (tethering):** cable → **USB controlled by → Connected device** → enable **USB tethering** → app mode **USB** → Mac **Android USB (tether)**. Note: tethering can steal Mac internet (phone becomes default route); OpenDisplay demotes that route so Wi‑Fi stays primary. Full detail: [`Android/README.md`](Android/README.md#usb-recommended-adb--keeps-mac-internet).
+   **USB without debugging (tethering):** cable → enable **USB
+   tethering** → app mode **USB** → Mac **Android USB (tether)**.
+   Tethering can steal Mac internet; OpenDisplay demotes that route
+   when possible. Full detail:
+   [`Android/README.md`](Android/README.md#usb-recommended-adb--keeps-mac-internet).
 4. Grant Mac **Screen Recording** + **Accessibility** if prompted.
 
 ## How it works
@@ -113,17 +141,19 @@ CGVirtualDisplay
    ← JSON (hello, touch, scroll) ═══════════════
 ```
 
-Screen stays on your LAN — never uploaded. Full wire format: [`WIRE.md`](WIRE.md).
+Screen stays on your LAN — never uploaded.
+Full wire format: [`WIRE.md`](WIRE.md).
 
 ## FAQ
 
 | Question | Answer |
 |---|---|
-| Mac doesn’t see the device? | Manual **IP:9000**; same LAN; try no VPN / client isolation |
-| Black screen? | Check `adb logcat -s DeviceReport H264Decoder`; Mac quality **Fast** |
+| Mac doesn’t see the device? | Manual **IP:9000**; same LAN; try no VPN |
+| Black screen? | `adb logcat -s DeviceReport H264Decoder`; Mac quality **Fast** |
 | High latency? | 5 GHz Wi‑Fi; Android **11+**; Mac **Balanced** / **Fast** |
-| iPhone / iPad? | [peetzweg/opendisplay](https://github.com/peetzweg/opendisplay) (TestFlight) |
-| Privacy? | Direct TCP only — [privacy page](https://peetzweg.github.io/opendisplay/privacy.html) |
+| Can’t use Mac apps while extended? | Lift finger from tablet; Cmd+Tab or **Retrieve Windows** |
+| iPhone / iPad? | [peetzweg/opendisplay](https://github.com/peetzweg/opendisplay) |
+| Privacy? | Direct TCP only — [privacy](https://peetzweg.github.io/opendisplay/privacy.html) |
 | License? | [GPL-3.0](LICENSE) (≤ v0.4.x remain MIT) |
 
 ## Comparison
@@ -137,7 +167,8 @@ Screen stays on your LAN — never uploaded. Full wire format: [`WIRE.md`](WIRE.
 
 ## Contributing
 
-Issues/PRs welcome. Conventional Commits (`feat:`, `fix:`, `docs:`…). Smoke checklist and layout: [`Android/README.md`](Android/README.md).
+Issues/PRs welcome. Conventional Commits (`feat:`, `fix:`, `docs:`…).
+Smoke checklist and layout: [`Android/README.md`](Android/README.md).
 
 ## License
 

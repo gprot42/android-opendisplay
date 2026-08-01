@@ -745,7 +745,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         let oldID = captureDisplayID
         // Pull windows off the virtual panel *before* tearing it down —
         // otherwise they stay at absolute coords that no longer exist.
-        // Must be synchronous: virtualDisplay = nil removes the display.
+        // Never use main.sync here: if main is busy (cursor poll / AX), we
+        // deadlock or freeze the UI. Async with a short wait + hard timeout.
         if oldID != 0 {
             let cleanup = { @MainActor in
                 _ = WindowRecovery.retrieveWindows(fromDisplay: oldID, includeOffScreen: true)
@@ -755,7 +756,14 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             if Thread.isMainThread {
                 MainActor.assumeIsolated { cleanup() }
             } else {
-                DispatchQueue.main.sync { MainActor.assumeIsolated { cleanup() } }
+                let sem = DispatchSemaphore(value: 0)
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated { cleanup() }
+                    sem.signal()
+                }
+                if sem.wait(timeout: .now() + 1.5) == .timedOut {
+                    Log.info("stop: window recovery timed out — tearing down display anyway")
+                }
             }
         }
         virtualDisplay = nil   // releasing it removes the display
@@ -784,9 +792,17 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         return n
     }
 
-    /// Clear a tablet-driven mouse-down and restore the Mac cursor.
-    func releaseInjectedPointer() {
-        inputInjector?.forceRelease()
+    /// Clear a tablet-driven mouse-down (optionally restore the Mac cursor).
+    /// No-op if the tablet is not currently capturing the pointer.
+    /// `postEvents: false` clears state only — use while the settings panel is
+    /// open so a synthetic mouse-up cannot cancel a real trackpad click.
+    func releaseInjectedPointer(restoreCursor: Bool = true, postEvents: Bool = true) {
+        inputInjector?.forceRelease(restoreCursor: restoreCursor, postEvents: postEvents)
+    }
+
+    /// Whether the tablet currently owns a synthetic mouse capture.
+    var hasInjectedPointerCapture: Bool {
+        inputInjector?.hasActiveCapture ?? false
     }
 
     /// Migrate the live session to another transport: swap the socket under
@@ -1385,21 +1401,19 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         scheduleCursorImagePoll()
     }
 
-    /// Sprite changes (arrow ↔ I-beam ↔ resize…) must land fast or the wrong
-    /// cursor shows over hot areas — poll at 30Hz on the main thread (NSCursor
-    /// is AppKit), hash the raw bitmap, and only PNG-encode + send on change.
+    /// Sprite changes (arrow ↔ I-beam ↔ resize…) — poll slowly on the main
+    /// thread. `NSCursor.currentSystem` hits WindowServer (SLSCopyRegistered
+    /// CursorImages) and at 30Hz it freezes the menu bar / whole app under load.
+    /// 5 Hz is enough for arrow↔I-beam; PNG work runs off-main after a cheap hash.
     ///
     /// A dedicated timer (cancelled+replaced here, like cursorTimer above) — not
-    /// a self-rescheduling asyncAfter chain. Every rebuild re-enters
-    /// startCursorEcho, and sleep/wake rebuilds happen often; a recursive chain
-    /// guarded only by `stopped` would stack one extra 30Hz main-thread
-    /// TIFF-encode loop per rebuild, creeping CPU to ~50% until a restart (#75).
+    /// a self-rescheduling asyncAfter chain (#75).
     private func scheduleCursorImagePoll() {
         cursorImageTimer?.cancel()
         let timer = DispatchSource.makeTimerSource(queue: .main)
-        timer.schedule(deadline: .now() + 0.033, repeating: .milliseconds(33))
+        timer.schedule(deadline: .now() + 0.2, repeating: .milliseconds(200))
         timer.setEventHandler { [weak self] in
-            guard let self, !self.stopped, self.localCursor else { return }
+            guard let self, !self.stopped, self.localCursor, self.connectionReady else { return }
             self.pollCursorImage()
         }
         timer.resume()
@@ -1431,30 +1445,40 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // sprite normalized against the 1x size renders at half size on the
         // device. Mixing the size into the dedup hash re-sends the sprite
         // whenever the mode flips, so the proportion always heals.
-        guard connectionReady, captureDisplayID != 0,
-              let cursor = NSCursor.currentSystem else { return }
+        guard connectionReady, captureDisplayID != 0 else { return }
+        // Prefer current (cheaper) over currentSystem — same for normal apps;
+        // only special system cursors differ.
+        let cursor = NSCursor.current
         let displaySize = CGDisplayBounds(captureDisplayID).size   // points, current mode
         guard displaySize.width > 0, displaySize.height > 0 else { return }
         let image = cursor.image
-        guard let tiff = image.tiffRepresentation else { return }
-        let hash = tiff.hashValue ^ Int(displaySize.width) &* 31
-        guard hash != lastCursorPNGHash else { return }
-        guard let rep = NSBitmapImageRep(data: tiff),
-              let png = rep.representation(using: .png, properties: [:]),
-              png.count < 24_000 else { return }
-        lastCursorPNGHash = hash
-        let size = image.size            // Mac points
+        let size = image.size
         let hot = cursor.hotSpot
-        // Normalized against the display so the phone can size/anchor the
-        // sprite without knowing capture scale or HiDPI factor.
-        let msg = String(format:
-            "{\"type\":\"cursorImg\",\"nw\":%.5f,\"nh\":%.5f,\"ax\":%.3f,\"ay\":%.3f,\"png\":\"%@\"}",
-            size.width / displaySize.width,
-            size.height / displaySize.height,
-            size.width > 0 ? hot.x / size.width : 0,
-            size.height > 0 ? hot.y / size.height : 0,
-            png.base64EncodedString())
-        queue.async { self.sendJSONFrame(msg) }
+        // Cheap identity: size + hotspot + image pointer — avoids full TIFF
+        // hash / encode on every tick when the cursor is unchanged.
+        let identity = "\(ObjectIdentifier(image as AnyObject))-\(Int(size.width))x\(Int(size.height))-\(Int(hot.x)),\(Int(hot.y))-\(Int(displaySize.width))"
+        let hash = identity.hashValue
+        guard hash != lastCursorPNGHash else { return }
+        lastCursorPNGHash = hash
+        // PNG encode off the main thread — this is what used to freeze UI.
+        let captureID = captureDisplayID
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self, !self.stopped else { return }
+            guard let tiff = image.tiffRepresentation,
+                  let rep = NSBitmapImageRep(data: tiff),
+                  let png = rep.representation(using: .png, properties: [:]),
+                  png.count < 24_000 else { return }
+            let liveSize = CGDisplayBounds(captureID).size
+            guard liveSize.width > 0, liveSize.height > 0 else { return }
+            let msg = String(format:
+                "{\"type\":\"cursorImg\",\"nw\":%.5f,\"nh\":%.5f,\"ax\":%.3f,\"ay\":%.3f,\"png\":\"%@\"}",
+                size.width / liveSize.width,
+                size.height / liveSize.height,
+                size.width > 0 ? hot.x / size.width : 0,
+                size.height > 0 ? hot.y / size.height : 0,
+                png.base64EncodedString())
+            self.queue.async { self.sendJSONFrame(msg) }
+        }
     }
 
     // MARK: - Control messages (phone -> Mac)
@@ -1565,6 +1589,12 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 }
             }
         case "touch":
+            // Hard block while settings UI is open — no HID events, no synthetic
+            // mouse-up (that was cancelling real trackpad clicks on the panel).
+            if InputInjector.injectionPaused {
+                inputInjector?.forceRelease(restoreCursor: false, postEvents: false)
+                break
+            }
             if let phase = obj["phase"] as? String,
                let x = obj["x"] as? Double,
                let y = obj["y"] as? Double {
@@ -1578,6 +1608,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 }
             }
         case "scroll":
+            if InputInjector.injectionPaused { break }
             if let dx = obj["dx"] as? Double, let dy = obj["dy"] as? Double {
                 inputInjector?.handleScroll(dx: dx, dy: dy)
             }
@@ -1892,7 +1923,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         pendingSends += 1
         connection.send(content: frame, completion: .contentProcessed { [weak self] error in
             guard let self else { return }
-            self.pendingSends -= 1
+            self.pendingSends = max(0, self.pendingSends - 1)
             if let error {
                 Log.info("send error: \(error)")
                 return

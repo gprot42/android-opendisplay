@@ -47,10 +47,32 @@ enum AndroidUsbCable {
         }
     }
 
+    /// Cache ioreg results — full USB tree dumps are expensive and the poll
+    /// loop was spawning one every 2s on a utility queue (UI hitch when
+    /// contended).
+    private static let cacheLock = NSLock()
+    private static var cachedDevices: [Device] = []
+    private static var cacheAt: Date = .distantPast
+    private static let cacheTTL: TimeInterval = 3
+
     /// Android-ish devices currently on the USB tree.
     static func connected() -> [Device] {
+        cacheLock.lock()
+        if Date().timeIntervalSince(cacheAt) < cacheTTL {
+            let hit = cachedDevices
+            cacheLock.unlock()
+            return hit
+        }
+        cacheLock.unlock()
+
         let out = shell("ioreg -p IOUSB -w0 -l")
-        return parseIoreg(out)
+        let parsed = parseIoreg(out)
+
+        cacheLock.lock()
+        cachedDevices = parsed
+        cacheAt = Date()
+        cacheLock.unlock()
+        return parsed
     }
 
     static func primary() -> Device? {
@@ -210,9 +232,9 @@ enum AndroidUsbCable {
         } catch {
             return ""
         }
-        let deadline = Date().addingTimeInterval(5)
+        let deadline = Date().addingTimeInterval(1.5)
         while task.isRunning, Date() < deadline {
-            Thread.sleep(forTimeInterval: 0.05)
+            Thread.sleep(forTimeInterval: 0.02)
         }
         if task.isRunning { task.terminate(); return "" }
         return String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
