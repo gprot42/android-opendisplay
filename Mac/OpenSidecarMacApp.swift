@@ -280,11 +280,13 @@ final class SenderController: ObservableObject {
                 }.value
                 self.androidUsbAvailable = !serials.isEmpty
                 self.androidUsbLabel = name ?? "Android USB"
-                // Refresh adb forward for a live Android USB session (replug).
+                // Keep adb forward alive for a live Android USB session
+                // (replug). Use ensureForward — a remove+re-add every poll
+                // would RST the open TCP stream.
                 if self.session(for: ConnectionTarget.androidUsb.sessionID) != nil,
                    let portNum = UInt16(self.port) {
                     await Task.detached(priority: .utility) {
-                        _ = AndroidAdb.forward(devicePort: portNum)
+                        _ = AndroidAdb.ensureForward(devicePort: portNum)
                     }.value
                 }
                 try? await Task.sleep(for: .seconds(3))
@@ -561,7 +563,7 @@ final class SenderController: ObservableObject {
             guard let portNum = UInt16(port) else { return }
             // Phone listens on devicePort; adb forward maps host loopback →
             // that port so we can dial 127.0.0.1 (must be forward, not reverse).
-            guard let hostPort = AndroidAdb.forward(devicePort: portNum) else {
+            guard let hostPort = AndroidAdb.ensureForward(devicePort: portNum) else {
                 Log.info("Android USB: adb forward failed — enable USB debugging, accept the RSA prompt, and ensure platform-tools `adb` is installed")
                 // Surface a dismissible row so the click isn't a silent no-op.
                 let name = label(for: target)

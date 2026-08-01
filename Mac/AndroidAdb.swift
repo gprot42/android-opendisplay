@@ -61,11 +61,46 @@ enum AndroidAdb {
         return "Android USB (\(serials.count) devices)"
     }
 
-    /// `adb [-s serial] forward tcp:HOST tcp:DEVICE` so Mac → `127.0.0.1:HOST`
-    /// reaches the phone’s listen port. Prefers the same host port as the
-    /// device; falls back if the host port is already taken.
-    ///
-    /// - Returns: Host port to dial on loopback, or `nil` if setup failed.
+    /// Host port already forwarded to `devicePort` on `serial`, if any.
+    static func existingHostPort(devicePort: UInt16, serial: String) -> UInt16? {
+        guard let adb = adbPath else { return nil }
+        // Global list is reliable across adb versions; filter by serial.
+        let out = shell("\(adb) forward --list")
+        // Lines: "SERIAL tcp:HOST tcp:DEVICE"
+        for line in out.split(separator: "\n", omittingEmptySubsequences: false) {
+            let parts = line.split(whereSeparator: { $0.isWhitespace })
+            guard parts.count >= 3, String(parts[0]) == serial,
+                  let host = parseTcpPort(parts[1]),
+                  let device = parseTcpPort(parts[2]),
+                  device == devicePort else { continue }
+            return host
+        }
+        return nil
+    }
+
+    /// Ensure a host→device forward exists without tearing down a working
+    /// tunnel (remove + re-add drops live TCP sessions). Returns the host
+    /// port to dial on loopback, or `nil` if setup failed.
+    @discardableResult
+    static func ensureForward(devicePort: UInt16, serial: String? = nil) -> UInt16? {
+        guard let adb = adbPath else {
+            Log.info("adb not found — install platform-tools for Android USB")
+            return nil
+        }
+        let serials = deviceSerials()
+        guard !serials.isEmpty else {
+            Log.info("adb: no device in 'device' state")
+            return nil
+        }
+        let target = serial.flatMap { serials.contains($0) ? $0 : nil } ?? serials[0]
+        if let existing = existingHostPort(devicePort: devicePort, serial: target) {
+            return existing
+        }
+        return installForward(adb: adb, target: target, devicePort: devicePort)
+    }
+
+    /// Force a fresh forward (e.g. first connect). Prefer ``ensureForward``
+    /// for live sessions so we don't RST an open stream every few seconds.
     @discardableResult
     static func forward(devicePort: UInt16, serial: String? = nil) -> UInt16? {
         guard let adb = adbPath else {
@@ -78,11 +113,21 @@ enum AndroidAdb {
             return nil
         }
         let target = serial.flatMap { serials.contains($0) ? $0 : nil } ?? serials[0]
+        return installForward(adb: adb, target: target, devicePort: devicePort)
+    }
 
+    private static func installForward(adb: String, target: String, devicePort: UInt16) -> UInt16? {
         // Prefer matching ports; fall back when something else owns the host
         // listen socket (another tool, leftover forward, etc.).
         let hostCandidates: [UInt16] = [devicePort, 19_000, 19_001, 29_000]
         for hostPort in hostCandidates {
+            // Only remove this host port if we're about to claim it — and only
+            // when it isn't already the correct mapping.
+            if let existing = existingHostPort(devicePort: devicePort, serial: target),
+               existing == hostPort {
+                Log.info("adb forward tcp:\(hostPort) → device tcp:\(devicePort) on \(target): already set")
+                return hostPort
+            }
             _ = shell("\(adb) -s \(target) forward --remove tcp:\(hostPort)")
             let out = shell("\(adb) -s \(target) forward tcp:\(hostPort) tcp:\(devicePort)")
             let lower = out.lowercased()
@@ -97,9 +142,14 @@ enum AndroidAdb {
         return nil
     }
 
-    /// Legacy name — calls ``forward(devicePort:serial:)`` and returns whether
-    /// a host port was installed. Prefer ``forward`` so callers dial the
-    /// returned host port (which may differ from the device port).
+    private static func parseTcpPort(_ token: Substring) -> UInt16? {
+        // "tcp:9000"
+        let s = String(token)
+        guard s.hasPrefix("tcp:") else { return nil }
+        return UInt16(s.dropFirst(4))
+    }
+
+    /// Legacy name — prefer ``ensureForward`` / ``forward``.
     @discardableResult
     @available(*, deprecated, renamed: "forward(devicePort:serial:)")
     static func reverse(port: UInt16, serial: String? = nil) -> Bool {
