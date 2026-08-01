@@ -68,6 +68,7 @@ Free, open source, no subscription — alternative to Sidecar / Duet / Luna on h
 | Device | Android | Result |
 |---|---|---|
 | Pixel 10 Pro XL | 16 / API 36 | Stream + touch + cursor (Wi‑Fi + USB via `adb forward`) |
+| **Google Pixel Tablet** (10.95″, 2560×1600) | 15 / API 35 | Stream + touch + cursor (Wi‑Fi + USB via `adb forward`) |
 
 More devices: PR welcome — model, Android version, pass/fail.
 

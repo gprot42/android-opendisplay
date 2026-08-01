@@ -54,6 +54,7 @@ Same wire protocol as iOS — see [`WIRE.md`](../WIRE.md). **Network is the defa
 | Device | Android | Result |
 |---|---|---|
 | Pixel 10 Pro XL | 16 / API 36* | Stream + touch + cursor (Wi‑Fi + USB via `adb forward`) |
+| **Google Pixel Tablet** (10.95″, 2560×1600) | 15 / API 35* | Stream + touch + cursor (Wi‑Fi + USB via `adb forward`) |
 
 \*Installs that report a higher API than `targetSdk` still run; we only require **≥ 26**.
 
