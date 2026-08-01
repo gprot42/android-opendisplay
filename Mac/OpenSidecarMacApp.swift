@@ -900,6 +900,34 @@ struct ContentView: View {
             }
             .padding(16)
 
+            // Screen Recording is required for any stream. Without it USB/Wi‑Fi
+            // can show "Connected" while the tablet stays black (fps=0) — surface
+            // that before the device list so it is not mistaken for a cable fault.
+            if !permissions.screenRecording {
+                HStack(alignment: .top, spacing: 10) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                        .font(.title3)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Screen Recording required")
+                            .font(.headline)
+                        Text("USB and Wi‑Fi both need this. Enable “OpenDisplay Dev” (or OpenDisplay) under System Settings → Privacy & Security → Screen Recording, then quit and reopen this app.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Button("Open Screen Recording Settings…") {
+                            permissions.requestScreenRecording()
+                        }
+                        .controlSize(.small)
+                        .buttonStyle(.borderedProminent)
+                    }
+                    Spacer(minLength: 0)
+                }
+                .padding(12)
+                .background(Color.orange.opacity(0.12))
+                Divider()
+            }
+
             Divider()
 
             // Settings
