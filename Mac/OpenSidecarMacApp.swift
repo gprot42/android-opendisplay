@@ -200,6 +200,10 @@ final class SenderController: ObservableObject {
     @Published var quality = StreamQuality(rawValue: UserDefaults.standard.string(forKey: "quality") ?? "") ?? .best {
         didSet { UserDefaults.standard.set(quality.rawValue, forKey: "quality") }
     }
+    /// Place the virtual display left or right of the Mac main screen.
+    @Published var displaySide = DisplayArrangement.preferredSide {
+        didSet { DisplayArrangement.preferredSide = displaySide }
+    }
 
     var running: Bool { !sessions.isEmpty }
 
@@ -945,6 +949,21 @@ struct ContentView: View {
                 .pickerStyle(.segmented)
                 .onChange(of: controller.mode) { controller.restartAll() }
 
+                if controller.mode == .extend {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Picker("Screen position", selection: $controller.displaySide) {
+                            ForEach(DisplaySide.allCases, id: \.self) { side in
+                                Text(side.shortLabel).tag(side)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .onChange(of: controller.displaySide) { controller.restartAll() }
+                        Text("Places the device \(controller.displaySide == .left ? "to the left" : "to the right") of your Mac display when connecting. Fine-tune anytime in System Settings → Displays.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
                 VStack(alignment: .leading, spacing: 4) {
                     Picker("Quality", selection: $controller.quality) {
                         ForEach(StreamQuality.allCases, id: \.self) { q in
@@ -978,7 +997,7 @@ struct ContentView: View {
                     }
                     .controlSize(.small)
                 }
-                .help("Opens System Settings → Displays, where you can position the extended displays relative to your Mac screen (Arrange…). Each device shows up as its own display, named after the device.")
+                .help("Opens System Settings → Displays for free-form arrangement. The Screen position control above re-applies Left/Right on the next connect.")
 
                 Section("Permissions") {
                     permissionRow(

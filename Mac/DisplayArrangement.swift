@@ -1,41 +1,84 @@
 import CoreGraphics
 import Foundation
 
-/// Remembers where the user placed each device's virtual display (#116).
+/// Which side of the Mac’s main display to park the virtual screen on
+/// when a session starts (or restarts). Users can still fine-tune in
+/// System Settings → Displays; the next connect re-applies this preference.
+enum DisplaySide: String, CaseIterable {
+    case left
+    case right
+
+    var label: String {
+        switch self {
+        case .left: return "Left of Mac"
+        case .right: return "Right of Mac"
+        }
+    }
+
+    var shortLabel: String {
+        switch self {
+        case .left: return "Left"
+        case .right: return "Right"
+        }
+    }
+}
+
+/// Places each device's virtual display relative to the main Mac screen.
 ///
 /// macOS does persist display arrangement, but keys it on the monitor
 /// identity (vendor/product/serial) — and ours legitimately changes: each
 /// orientation uses a distinct serial (saved-mode separation, see
 /// setupExtend), and the serial also derives from the session id, so USB
-/// and WiFi produce different identities for the same iPad. Every such
+/// and WiFi produce different identities for the same device. Every such
 /// change makes macOS treat the display as a brand-new monitor and park it
-/// at the default position. Keying saved origins on the device's install id
-/// makes the arrangement follow the physical device instead.
+/// at a default position. We therefore force placement from the user’s
+/// Left/Right preference (and still remember drag adjustments for the
+/// short restore window while the display settles).
 enum DisplayArrangement {
 
+    private static let sideKey = "displaySide"
+
+    /// Global preference: place extended screens left or right of the Mac.
+    static var preferredSide: DisplaySide {
+        get {
+            DisplaySide(rawValue: UserDefaults.standard.string(forKey: sideKey) ?? "") ?? .right
+        }
+        set {
+            UserDefaults.standard.set(newValue.rawValue, forKey: sideKey)
+        }
+    }
+
+    /// Origin for a new virtual display of `size` points, on the preferred
+    /// side of the main display (tops aligned). WindowServer may snap the
+    /// final position to a valid adjacent arrangement.
+    static func origin(for size: CGSize, device: String) -> CGPoint? {
+        // Prefer the explicit Left/Right setting so orientation / transport
+        // identity churn doesn’t shuffle the phone to a random corner.
+        // Per-device drag memory still records via `save` for diagnostics
+        // and a future “remember last” mode, but does not override the setting.
+        _ = device
+        return sideOrigin(preferredSide, size: size)
+    }
+
+    /// Point-origin so the virtual display sits flush against the main
+    /// screen on `side`, top edges aligned.
+    static func sideOrigin(_ side: DisplaySide, size: CGSize) -> CGPoint {
+        let main = CGDisplayBounds(CGMainDisplayID())
+        let y = main.minY
+        switch side {
+        case .right:
+            return CGPoint(x: main.maxX, y: y)
+        case .left:
+            return CGPoint(x: main.minX - size.width, y: y)
+        }
+    }
+
     /// Record the origin (global desktop points) the display settled at.
-    /// One record per device — the latest arrangement wins regardless of
-    /// orientation, so the display follows wherever the user last put it
-    /// (tested per-orientation spots and flipping back to an orientation's
-    /// old position reads as broken; deliberate split positions are a
-    /// possible opt-in, see #128).
+    /// Kept so a future “remember last drag” option can restore it; the
+    /// active Left/Right setting wins on the next connect today.
     static func save(origin: CGPoint, size: CGSize, device: String) {
         UserDefaults.standard.set([Int(origin.x), Int(origin.y), Int(size.width), Int(size.height)],
                                   forKey: key(device))
-    }
-
-    /// Where a new display of `size` points should go: the saved spot —
-    /// verbatim when the size matches, else mapped to keep the display's
-    /// center (WindowServer then snaps that to the nearest valid adjacent
-    /// arrangement, so a rotated display stays on the same side of the
-    /// desktop). Nil on first contact — let macOS choose.
-    static func origin(for size: CGSize, device: String) -> CGPoint? {
-        guard let v = UserDefaults.standard.array(forKey: key(device)) as? [Int],
-              v.count == 4 else { return nil }
-        let saved = CGRect(x: CGFloat(v[0]), y: CGFloat(v[1]),
-                           width: CGFloat(v[2]), height: CGFloat(v[3]))
-        if saved.size == size { return saved.origin }
-        return CGPoint(x: saved.midX - size.width / 2, y: saved.midY - size.height / 2)
     }
 
     private static func key(_ device: String) -> String { "displayOrigin.\(device)" }
