@@ -204,6 +204,17 @@ final class SenderController: ObservableObject {
     @Published var displaySide = DisplayArrangement.preferredSide {
         didSet { DisplayArrangement.preferredSide = displaySide }
     }
+    /// When true: focusing an app via Dock / Cmd+Tab / click pulls that
+    /// app’s windows off the tablet back onto the Mac automatically.
+    /// Default is **off** — windows stay on the tablet until Retrieve / Send.
+    @Published var focusRetrieveEnabled: Bool = {
+        if UserDefaults.standard.object(forKey: "focusRetrieveEnabled") == nil {
+            return false
+        }
+        return UserDefaults.standard.bool(forKey: "focusRetrieveEnabled")
+    }() {
+        didSet { UserDefaults.standard.set(focusRetrieveEnabled, forKey: "focusRetrieveEnabled") }
+    }
 
     var running: Bool { !sessions.isEmpty }
 
@@ -332,6 +343,8 @@ final class SenderController: ObservableObject {
             session.sender.releaseInjectedPointer()
         }
 
+        // Optional: pull windows back to the Mac when the app is activated.
+        guard focusRetrieveEnabled else { return }
         guard AXIsProcessTrusted() else { return }
         // Pull this app’s windows off the virtual tablet even if the cursor
         // is still stranded there — otherwise Cmd+Tab “selects” iTerm2 with
@@ -1221,9 +1234,19 @@ struct ContentView: View {
                              : "Tablet sits right of the Mac — move the mouse right to reach it.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
-                        Text("Apps on the tablet stay there. Touching the tablet moves the Mac cursor onto it — lift your finger and the cursor returns here. Cmd+Tab / Dock or Retrieve Windows brings windows back to the Mac.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                        Toggle(isOn: $controller.focusRetrieveEnabled) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Click to restore to Mac")
+                                Text(controller.focusRetrieveEnabled
+                                     ? "Dock, Cmd+Tab, or clicking an app pulls its windows off the tablet onto this Mac."
+                                     : "Off by default — windows stay on the tablet until you press Retrieve / Send.")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                        }
+                        .toggleStyle(.switch)
+                        .help("When enabled, activating an app from the Mac moves that app’s windows from the tablet back here. Off by default. Needs Accessibility.")
                         if controller.sessions.contains(where: { $0.sender.canHostWindows }) {
                             Button {
                                 let n = controller.retrieveAllWindowsToMac()
